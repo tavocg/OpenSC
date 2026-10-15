@@ -23,6 +23,7 @@
 #define SC_IASECC_SDO_H
 
 #include "libopensc/types.h"
+#include "libopensc/errors.h"
 
 #define IASECC_SDO_TAG_HEADER	0xBF
 
@@ -41,6 +42,7 @@
 #define IASECC_DOCP_TAG_ACLS_CONTACTLESS	0x9C
 #define IASECC_DOCP_TAG_ISSUER_DATA_BER		0xA5
 #define IASECC_DOCP_TAG_ISSUER_DATA		0x85
+#define IASECC_DOCP_TAG_CHIPDOC_C9		0xC9
 
 #define IASECC_ACLS_CHV_CHANGE		0
 #define IASECC_ACLS_CHV_VERIFY		1
@@ -186,6 +188,8 @@ struct iasecc_sdo_docp  {
 	struct iasecc_extended_tlv acls_contact;
 	struct iasecc_extended_tlv acls_contactless;
 	struct iasecc_extended_tlv issuer_data;
+	/* Observed ChipDoc extension, retained without assigning semantics. */
+	struct iasecc_extended_tlv chipdoc_c9;
 
 	unsigned char amb, scbs[IASECC_MAX_SCBS];
 };
@@ -303,6 +307,39 @@ struct iasecc_sm_cmd_create_file {
 };
 
 struct sc_card;
+/* Collect all compact ACL groups without selecting between alternatives.
+ * File operations marked 0xFF are ignored, as in the file ACL mapping.
+ */
+static inline int
+iasecc_parse_compact_acls(const unsigned char *data, size_t size,
+		const unsigned char *ops, unsigned char *amb, unsigned char *scbs)
+{
+	size_t offs;
+	unsigned char mask, modes;
+	int ii;
+
+	if ((!data && size) || !amb || !scbs)
+		return SC_ERROR_INVALID_ARGUMENTS;
+	*amb = 0;
+	for (ii = 0; ii < IASECC_MAX_SCBS; ii++)
+		scbs[ii] = 0xFF;
+	for (offs = 0; offs < size;) {
+		modes = data[offs++];
+		for (ii = 0, mask = 0x40; ii < IASECC_MAX_SCBS; ii++, mask >>= 1) {
+			if (!(modes & mask))
+				continue;
+			if (offs >= size)
+				return SC_ERROR_INVALID_DATA;
+			if ((!ops || ops[ii] != 0xFF) && (*amb & mask) && scbs[ii] != data[offs])
+				return SC_ERROR_NOT_SUPPORTED;
+			*amb |= mask;
+			scbs[ii] = data[offs++];
+		}
+	}
+	return SC_SUCCESS;
+}
+
+
 int iasecc_sdo_convert_acl(struct sc_card *, struct iasecc_sdo *, unsigned char, unsigned *, unsigned *);
 void iasecc_sdo_free_fields(struct sc_card *, struct iasecc_sdo *);
 void iasecc_sdo_free(struct sc_card *, struct iasecc_sdo *);

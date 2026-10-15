@@ -421,6 +421,8 @@ typedef struct sc_reader {
 #define SC_PIN_CMD_USE_PINPAD		0x0001
 #define SC_PIN_CMD_NEED_PADDING		0x0002
 #define SC_PIN_CMD_IMPLICIT_CHANGE	0x0004
+/* GET_INFO only: driver must explicitly support a query without selection or policy reads. */
+#define SC_PIN_CMD_STATUS_ONLY		0x0008
 
 #define SC_PIN_ENCODING_ASCII	0
 #define SC_PIN_ENCODING_BCD	1

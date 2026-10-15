@@ -44,9 +44,7 @@ iasecc_parse_acls(struct sc_card *card, struct iasecc_sdo_docp *docp, int flags)
 {
 	struct sc_context *ctx = card->ctx;
 	struct iasecc_extended_tlv *acls = &docp->acls_contact;
-	int ii;
-	size_t offs;
-	unsigned char mask = 0x40;
+	int rv;
 
 	if (flags)
 		acls = &docp->acls_contactless;
@@ -54,15 +52,26 @@ iasecc_parse_acls(struct sc_card *card, struct iasecc_sdo_docp *docp, int flags)
 	if (!acls->size)
 		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_DATA);
 
-	docp->amb = *(acls->value + 0);
-	memset(docp->scbs, 0xFF, sizeof(docp->scbs));
-	for (ii=0, offs = 1; ii<7; ii++, mask >>= 1)
-		if (mask & docp->amb) {
-			if (offs >= acls->size) {
-				LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_DATA);
-			}
-			docp->scbs[ii] = *(acls->value + offs++);
-		}
+	if (docp->chipdoc_c9.value) {
+		static const unsigned char observed_chv_acl[] = {
+			0xF3, 0xE7, 0x00, 0xE7, 0xFF, 0x00, 0xD0, 0xD3, 0xD3
+		};
+		/* The captured profile has unrestricted VERIFY and GET DATA.
+		 * The remaining rules include conditions not yet represented here.
+		 * Expose only these two operations, for the exact contact ACL.
+		 */
+		if (flags || acls->size != sizeof(observed_chv_acl) ||
+				memcmp(acls->value, observed_chv_acl, sizeof(observed_chv_acl)))
+			LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+		docp->amb = 0x21;
+		memset(docp->scbs, 0xFF, sizeof(docp->scbs));
+		docp->scbs[IASECC_ACLS_CHV_VERIFY] = 0;
+		docp->scbs[IASECC_ACLS_CHV_GET_DATA] = 0;
+		LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+	}
+
+	rv = iasecc_parse_compact_acls(acls->value, acls->size, NULL, &docp->amb, docp->scbs);
+	LOG_TEST_RET(ctx, rv, "Cannot parse compact ACL groups");
 
 	sc_log(ctx, "iasecc_parse_docp() SCBs %02X:%02X:%02X:%02X:%02X:%02X:%02X",
 			docp->scbs[0],docp->scbs[1],docp->scbs[2],docp->scbs[3],
@@ -161,6 +170,7 @@ iasecc_sdo_free_fields(struct sc_card *card, struct iasecc_sdo *sdo)
 	free(sdo->docp.size.value);
 	free(sdo->docp.name.value);
 	free(sdo->docp.issuer_data.value);
+	free(sdo->docp.chipdoc_c9.value);
 
 	if (sdo->sdo_class == IASECC_SDO_CLASS_RSA_PUBLIC)   {
 		free(sdo->data.pub_key.n.value);
@@ -647,6 +657,13 @@ iasecc_parse_docp(struct sc_card *card, unsigned char *data, size_t data_len, st
 			free(sdo->docp.tries_remaining.value);
 			sdo->docp.tries_remaining = tlv;
 		}
+		else if (tlv.tag == IASECC_DOCP_TAG_CHIPDOC_C9 &&
+				card->type == SC_CARD_TYPE_IASECC_AMOS &&
+				sdo->sdo_class == IASECC_SDO_CLASS_CHV && sdo->sdo_ref == 1 &&
+				tlv.size == 1 && tlv.value[0] == 1) {
+			free(sdo->docp.chipdoc_c9.value);
+			sdo->docp.chipdoc_c9 = tlv;
+		}
 		else   {
 			free(tlv.value);
 			LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "iasecc_parse_get_tlv() parse error: non DOCP tag");
@@ -799,7 +816,8 @@ iasecc_sdo_parse(struct sc_card *card, unsigned char *data, size_t data_len, str
 	offs = 3 + size_size;
 	for (; offs < data_len;)   {
 		rv = iasecc_sdo_parse_data(card, data + offs, data_len - offs, sdo);
-		if (rv != SC_SUCCESS) {
+		/* A successful parse returns the number of consumed bytes. */
+		if (rv < 0) {
 			iasecc_sdo_free_fields(card, sdo);
 			LOG_TEST_RET(ctx, rv, "parse error: invalid SDO data");
 		}
@@ -1358,6 +1376,9 @@ iasecc_docp_copy(struct sc_context *ctx, struct iasecc_sdo_docp *in, struct iase
 	LOG_TEST_RET(ctx, rv, "TLV copy error");
 
 	rv = iasecc_tlv_copy(ctx, &in->acls_contactless, &out->acls_contactless);
+	LOG_TEST_RET(ctx, rv, "TLV copy error");
+
+	rv = iasecc_tlv_copy(ctx, &in->chipdoc_c9, &out->chipdoc_c9);
 	LOG_TEST_RET(ctx, rv, "TLV copy error");
 
 	out->amb = in->amb;

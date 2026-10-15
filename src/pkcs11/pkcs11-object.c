@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "sc-pkcs11.h"
+#include "libopensc/iasecc.h"
 
 static void sc_find_release(sc_pkcs11_operation_t *operation);
 
@@ -297,6 +298,7 @@ out:
 		sc_log(context, "C_GetAttributeValue(hSession=0x%lx, hObject=0x%lx) = 0x%lx",
                         hSession, hObject, rv);
 
+	sc_api_metadata_trace(SC_API_GET_ATTRIBUTE, hSession, rv, hObject, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -452,6 +454,7 @@ C_FindObjectsInit(CK_SESSION_HANDLE hSession,	/* the session's handle */
 	sc_log(context, "%d matching objects\n", operation->num_handles);
 
 out:
+	sc_api_metadata_trace(SC_API_FIND_INIT, hSession, rv, 0, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -679,6 +682,13 @@ C_SignInit(CK_SESSION_HANDLE hSession,		/* the session's handle */
 		rv = CKR_KEY_TYPE_INCONSISTENT;
 		goto out;
 	}
+	/* This profile requires a live user login, including before preparing
+	 * another operation after a PSO/reset closed the owned transaction. */
+	if (session->slot->p11card && iasecc_chipdoc_configured(session->slot->p11card->card) &&
+			(session->slot->login_user != CKU_USER || slot_get_logged_in_state(session->slot) != SC_PIN_STATE_LOGGED_IN)) {
+		rv = CKR_USER_NOT_LOGGED_IN;
+		goto out;
+	}
 
 	rv = object->ops->get_attribute(session, object, &sign_attribute);
 	if (rv != CKR_OK || !can_sign) {
@@ -695,6 +705,7 @@ C_SignInit(CK_SESSION_HANDLE hSession,		/* the session's handle */
 
 out:
 	SC_LOG_RV("C_SignInit() = %s", rv);
+	sc_api_metadata_trace(SC_API_SIGN_INIT, hSession, rv, pMechanism->mechanism, hKey);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -743,6 +754,7 @@ C_Sign(CK_SESSION_HANDLE hSession,		/* the session's handle */
 
 out:
 	SC_LOG_RV("C_Sign() = %s", rv);
+	sc_api_metadata_trace(SC_API_SIGN, hSession, rv, pSignature != NULL, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -765,6 +777,7 @@ C_SignUpdate(CK_SESSION_HANDLE hSession,	/* the session's handle */
 		rv = sc_pkcs11_sign_update(session, pPart, ulPartLen);
 
 	SC_LOG_RV("C_SignUpdate() = %s", rv);
+	sc_api_metadata_trace(SC_API_SIGN_UPDATE, hSession, rv, 0, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -807,6 +820,7 @@ C_SignFinal(CK_SESSION_HANDLE hSession,		/* the session's handle */
 
 out:
 	SC_LOG_RV("C_SignFinal() = %s", rv);
+	sc_api_metadata_trace(SC_API_SIGN_FINAL, hSession, rv, pSignature != NULL, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }

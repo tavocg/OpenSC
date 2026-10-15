@@ -2737,6 +2737,11 @@ static void sign_data(CK_SLOT_ID slot, CK_SESSION_HANDLE session,
 				util_fatal("malloc() failure\n");
 			rv = p11->C_Sign(session, in_buffer, sz, sig_buffer, &sig_len);
 		}
+		if (rv != CKR_OK) {
+			const char *stop = getenv("OPENSC_PKCS11_TOOL_NO_SIGN_FALLBACK");
+			if (stop && !strcmp(stop, "yes"))
+				p11_fatal("C_Sign", rv);
+		}
 	}
 
 	if (rv != CKR_OK)   {

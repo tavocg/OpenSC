@@ -31,6 +31,7 @@
 #include "internal.h"
 #include "pkcs15.h"
 #include "asn1.h"
+#include "iasecc.h"
 #include "common/libscdl.h"
 #include "common/compat_strlcat.h"
 #include "common/compat_strlcpy.h"
@@ -1398,6 +1399,15 @@ sc_pkcs15_bind(struct sc_card *card, struct sc_aid *aid,
 		LOG_FUNC_RETURN(ctx, r);
 	}
 
+	/* This explicit candidate uses native directories only. A failed bind or
+	 * post-bind validation must not recover through a synthetic IAS profile. */
+	if (iasecc_chipdoc_configured(card)) {
+		p15card->opts.use_file_cache = SC_PKCS15_OPTS_CACHE_NO_FILES;
+		p15card->opts.use_pin_cache = 0;
+		r = sc_pkcs15_bind_internal(p15card,aid);
+		if (r < 0) goto error;
+		goto done;
+	}
 	enable_emu = scconf_get_bool(conf_block, "enable_pkcs15_emulation", 1);
 	if (enable_emu) {
 		sc_log(ctx, "PKCS#15 emulation enabled");
@@ -1424,6 +1434,10 @@ sc_pkcs15_bind(struct sc_card *card, struct sc_aid *aid,
 			goto error;
 	}
 done:
+	if (iasecc_chipdoc_configured(card)) {
+		r = iasecc_chipdoc_pkcs15_activate(p15card);
+		if (r < 0) goto error;
+	}
 	*p15card_out = p15card;
 	sc_unlock(card);
 	LOG_FUNC_RETURN(ctx, SC_SUCCESS);

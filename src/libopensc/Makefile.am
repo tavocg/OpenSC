@@ -15,6 +15,11 @@ noinst_HEADERS = cards.h ctbcs.h internal.h muscle.h muscle-filesystem.h \
 	jpki.h sc-ossl-compat.h card-npa.h card-openpgp.h \
 	card-eoi.h card-dtrust.h card-srbeid.h ccid-types.h reader-tr03119.h \
 	card-cac-common.h card-cardos-common.h
+noinst_HEADERS += api-trace.h iasecc-chipdoc.h iasecc-chipdoc-sm.h \
+	iasecc-chipdoc-pkcs15.h iasecc-chipdoc-transaction.h \
+	iasecc-chipdoc-routing.h iasecc-chipdoc-init.h jcop4-dh-control.h \
+	jcop4-channel-kdf.h jcop4-channel-primitives.h jcop4-channel-agreement.h \
+	jcop4-channel-messages.h jcop4-channel-confirmation.h jcop4-channel-controls.h
 
 AM_CPPFLAGS = -D'OPENSC_CONF_PATH="$(sysconfdir)/opensc.conf"' \
      -D'DEFAULT_SM_MODULE_PATH="$(DEFAULT_SM_MODULE_PATH)"' \
@@ -46,7 +51,7 @@ libopensc_la_SOURCES_BASE = \
 	card-muscle.c card-asepcos.c card-gemsafeV1.c card-rutoken.c \
 	card-rtecp.c card-myeid.c \
 	card-itacns.c card-authentic.c \
-	card-iasecc.c iasecc-sdo.c iasecc-sm.c card-sc-hsm.c \
+	card-iasecc.c iasecc-sdo.c iasecc-sm.c iasecc-chipdoc-sm.c iasecc-chipdoc-bind.c card-sc-hsm.c \
 	card-dnie.c cwa14890.c cwa-dnie.c \
 	card-isoApplet.c card-masktech.c card-gids.c card-jpki.c \
 	card-npa.c card-esteid2018.c card-esteid2025.c card-idprime.c \
@@ -128,7 +133,7 @@ TIDY_FILES = \
 	card-muscle.c card-asepcos.c card-gemsafeV1.c card-rutoken.c \
 	card-rtecp.c card-myeid.c \
 	card-itacns.c card-authentic.c \
-	card-iasecc.c iasecc-sdo.c iasecc-sm.c card-sc-hsm.c \
+	card-iasecc.c iasecc-sdo.c iasecc-sm.c iasecc-chipdoc-sm.c iasecc-chipdoc-bind.c card-sc-hsm.c \
 	cwa14890.c cwa-dnie.c \
 	card-isoApplet.c card-masktech.c card-jpki.c \
 	card-npa.c card-esteid2018.c card-idprime.c \

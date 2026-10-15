@@ -28,6 +28,7 @@
 #include "asn1.h"
 #include "iso7816.h"
 #include "sm/sm-iso.h"
+#include "api-trace.h"
 
 void
 iso7816_fixup_transceive_length(const struct sc_card *card,
@@ -1302,6 +1303,9 @@ iso7816_pin_cmd(struct sc_card *card, struct sc_pin_cmd_data *data)
 	 */
 	if (data->apdu == NULL) {
 		r = iso7816_build_pin_apdu(card, &local_apdu, data, sbuf, sizeof(sbuf));
+		if (data->cmd == SC_PIN_CMD_VERIFY)
+			sc_api_metadata_trace(SC_API_PIN_APDU_BUILD, 0, (unsigned long)r,
+					data->pin_reference, 0);
 		if (r < 0)
 			return r;
 		data->apdu = &local_apdu;
@@ -1332,6 +1336,11 @@ iso7816_pin_cmd(struct sc_card *card, struct sc_pin_cmd_data *data)
 			r = SC_ERROR_NOT_SUPPORTED;
 		}
 	}
+
+	/* Fixed result metadata only; never trace the credential or its length. */
+	if (data->cmd == SC_PIN_CMD_VERIFY)
+		sc_api_metadata_trace(SC_API_PIN_TRANSMIT, 0, (unsigned long)r,
+				data->pin_reference, r < 0 ? 0 : ((unsigned long)apdu->sw1 << 8) | apdu->sw2);
 
 	/* Don't pass references to local variables up to the caller. */
 	if (data->apdu == &local_apdu)

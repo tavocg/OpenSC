@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "sc-pkcs11.h"
+#include "libopensc/iasecc.h"
 
 CK_RV get_session(CK_SESSION_HANDLE hSession, struct sc_pkcs11_session **session)
 {
@@ -95,6 +96,7 @@ CK_RV C_OpenSession(CK_SLOT_ID slotID,	/* the slot's ID */
 
 out:
 	SC_LOG_RV("C_OpenSession() = %s", rv);
+	sc_api_metadata_trace(SC_API_OPEN_SESSION, rv == CKR_OK ? *phSession : 0, rv, slotID, flags);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -105,6 +107,8 @@ static CK_RV sc_pkcs11_close_session(CK_SESSION_HANDLE hSession)
 {
 	struct sc_pkcs11_slot *slot;
 	struct sc_pkcs11_session *session;
+	CK_RV closed = CKR_OK;
+	int chipdoc;
 
 	sc_log(context, "real C_CloseSession(0x%lx)", hSession);
 
@@ -116,14 +120,17 @@ static CK_RV sc_pkcs11_close_session(CK_SESSION_HANDLE hSession)
 	 * we log out */
 	slot = session->slot;
 	slot->nsessions--;
-	if (slot->nsessions == 0 && slot->login_user >= 0) {
+	chipdoc = slot->p11card && iasecc_chipdoc_configured(slot->p11card->card);
+	if (slot->nsessions == 0 && (slot->login_user >= 0 || chipdoc)) {
 		slot->login_user = -1;
 		if (sc_pkcs11_conf.atomic)
 			pop_all_login_states(slot);
 		else {
 			if (slot->p11card == NULL)
 				return CKR_TOKEN_NOT_RECOGNIZED;
-			slot->p11card->framework->logout(slot);
+			CK_RV result = slot->p11card->framework->logout(slot);
+			if (chipdoc)
+				closed = result;
 		}
 	}
 	for (size_t i = 0; i < SC_PKCS11_OPERATION_MAX; i++)
@@ -132,7 +139,7 @@ static CK_RV sc_pkcs11_close_session(CK_SESSION_HANDLE hSession)
 	if (list_delete(&sessions, session) != 0)
 		sc_log(context, "Could not delete session from list!");
 	free(session);
-	return CKR_OK;
+	return closed;
 }
 
 /* Internal version of C_CloseAllSessions that gets called with
@@ -165,6 +172,7 @@ CK_RV C_CloseSession(CK_SESSION_HANDLE hSession)
 
 	rv = sc_pkcs11_close_session(hSession);
 
+	sc_api_metadata_trace(SC_API_CLOSE_SESSION, hSession, rv, 0, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -187,6 +195,7 @@ CK_RV C_CloseAllSessions(CK_SLOT_ID slotID)
 	rv = sc_pkcs11_close_all_sessions(slotID);
 
 out:
+	sc_api_metadata_trace(SC_API_CLOSE_ALL_SESSIONS, 0, rv, slotID, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -304,6 +313,7 @@ out:
 		sc_log(context, "C_GetSessionInfo(0x%lx) = %s", hSession, name);
 	else
 		sc_log(context, "C_GetSessionInfo(0x%lx) = 0x%lx", hSession, rv);
+	sc_api_metadata_trace(SC_API_SESSION_INFO, hSession, rv, rv == CKR_OK ? pInfo->state : CK_UNAVAILABLE_INFORMATION, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -353,6 +363,18 @@ CK_RV C_Login(CK_SESSION_HANDLE hSession,	/* the session's handle */
 	sc_log(context, "C_Login(0x%lx, %lu)", hSession, userType);
 
 	slot = session->slot;
+	if (slot->p11card && iasecc_chipdoc_configured(slot->p11card->card)) {
+		reset_login_state(slot, CKR_OK);
+		if (userType != CKU_USER) {
+			rv = CKR_USER_TYPE_INVALID;
+			goto out;
+		}
+		/* Software PIN only; a reader PIN-pad is not this profile's path. */
+		if (!pPin || ulPinLen < 6 || ulPinLen > 14) {
+			rv = CKR_PIN_LEN_RANGE;
+			goto out;
+		}
+	}
 
 	if (!(slot->token_info.flags & CKF_USER_PIN_INITIALIZED) && userType == CKU_USER) {
 		rv = CKR_USER_PIN_NOT_INITIALIZED;
@@ -398,6 +420,7 @@ CK_RV C_Login(CK_SESSION_HANDLE hSession,	/* the session's handle */
 	}
 
 out:
+	sc_api_metadata_trace(SC_API_LOGIN, hSession, rv, userType, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -446,6 +469,7 @@ CK_RV C_Logout(CK_SESSION_HANDLE hSession)
 		rv = CKR_USER_NOT_LOGGED_IN;
 
 out:
+	sc_api_metadata_trace(SC_API_LOGOUT, hSession, rv, 0, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }

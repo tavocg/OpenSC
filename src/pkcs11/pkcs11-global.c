@@ -629,6 +629,7 @@ CK_RV C_GetSlotInfo(CK_SLOT_ID slotID, CK_SLOT_INFO_PTR pInfo)
 		return rv;
 
 	sc_log(context, "C_GetSlotInfo(0x%lx)", slotID);
+	sc_api_metadata_trace(SC_API_SLOT_INFO_BEGIN, 0, CKR_OK, slotID, 0);
 
 	if (sc_pkcs11_conf.init_sloppy) {
 		/* Most likely virtual_slots is empty and has not
@@ -674,6 +675,8 @@ CK_RV C_GetSlotInfo(CK_SLOT_ID slotID, CK_SLOT_INFO_PTR pInfo)
 		sc_log(context, "C_GetSlotInfo(0x%lx) = %s", slotID, name);
 	else
 		sc_log(context, "C_GetSlotInfo(0x%lx) = 0x%08lX", slotID, rv);
+	sc_api_metadata_trace(SC_API_SLOT_INFO, 0, rv, slotID,
+			rv == CKR_OK ? pInfo->flags : 0);
 	sc_pkcs11_unlock();
 	return rv;
 }

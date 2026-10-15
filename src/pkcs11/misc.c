@@ -25,6 +25,7 @@
 
 #include "common/constant-time.h"
 #include "sc-pkcs11.h"
+#include "libopensc/iasecc.h"
 
 #define DUMP_TEMPLATE_MAX	32
 
@@ -178,6 +179,20 @@ CK_RV reset_login_state(struct sc_pkcs11_slot *slot, CK_RV rv)
 		if (constant_time_eq_s(rv, CKR_USER_NOT_LOGGED_IN)) {
 			slot->login_user = -1;
 			pop_all_login_states(slot);
+		}
+		/* ChipDoc PSO closes its owned transaction. Align logical login with
+		 * the driver's local proof; GET_INFO sends no status APDU. */
+		if (slot->p11card && iasecc_chipdoc_configured(slot->p11card->card)) {
+			struct sc_pin_cmd_data data = {0};
+			int rc;
+			data.cmd = SC_PIN_CMD_GET_INFO;
+			data.pin_type = SC_AC_CHV;
+			data.pin_reference = 1;
+			rc = sc_pin_cmd(slot->p11card->card, &data);
+			if (rc || data.pin1.logged_in != SC_PIN_STATE_LOGGED_IN) {
+				slot->login_user = -1;
+				pop_all_login_states(slot);
+			}
 		}
 	}
 

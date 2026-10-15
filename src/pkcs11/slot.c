@@ -219,7 +219,7 @@ card_detect(sc_reader_t *reader, void **reader_states)
 	CK_RV rv;
 	unsigned int i;
 	int j;
-	static int retry = 3;
+	int retry = 3;
 
 	sc_log(context, "%s: Detecting smart card", reader->name);
 	/* Check if someone inserted a card */
@@ -241,6 +241,7 @@ card_detect(sc_reader_t *reader, void **reader_states)
 
 again:
 	rc = sc_detect_card_presence(reader);
+	sc_api_metadata_trace(SC_API_CARD_PRESENCE, 0, (CK_RV)rc, 0, 0);
 	if (rc < 0) {
 		sc_log(context, "%s: failed, %s", reader->name, sc_strerror(rc));
 		return sc_to_cryptoki_error(rc, NULL);
@@ -251,7 +252,9 @@ again:
 		return CKR_TOKEN_NOT_PRESENT;
 	}
 
-	if (no_change == 1) {
+	/* A reader can observe a replacement even when the event wait timed out
+	 * or reported another reader. Never reuse the old connection in that case. */
+	if (no_change == 1 && !(rc & SC_READER_CARD_CHANGED)) {
 		sc_log(context, "%s: card present, no change detected", reader->name);
 		return CKR_OK;
 	}
@@ -259,12 +262,13 @@ again:
 	/* If the card was changed, disconnect the current one */
 	if (rc & SC_READER_CARD_CHANGED) {
 		sc_log(context, "%s: Card changed", reader->name);
+		/* After removal, continue through connection and framework binding. */
+		no_change = 0;
 		/* The following should never happen - but if it
 		 * does we'll be stuck in an endless loop.
 		 * So better be fussy.*/
 		card_removed(reader);
 		if (!retry--) {
-			retry = 3;
 			return CKR_TOKEN_NOT_PRESENT;
 		}
 		goto again;
@@ -534,6 +538,8 @@ CK_RV slot_token_removed(CK_SLOT_ID id)
 		return rv;
 
 	token_was_present = (slot->slot_info.flags & CKF_TOKEN_PRESENT);
+	sc_api_metadata_trace(SC_API_SLOT_TOKEN_REMOVED, 0, CKR_OK, id,
+			token_was_present ? 1 : 0);
 
 	/* Terminate active sessions */
 	sc_pkcs11_close_all_sessions(id);

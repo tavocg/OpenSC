@@ -39,6 +39,7 @@
 #include <openssl/x509v3.h>
 
 #include "internal.h"
+#include "api-trace.h"
 #include "asn1.h"
 #include "cardctl.h"
 #include "opensc.h"
@@ -49,6 +50,8 @@
 #include "gp.h"
 
 #include "iasecc.h"
+#include "iasecc-chipdoc-transaction.h"
+#include "iasecc-chipdoc-init.h"
 
 #define IASECC_CARD_DEFAULT_FLAGS ( 0			\
 		| SC_ALGORITHM_ONBOARD_KEY_GEN		\
@@ -136,13 +139,17 @@ struct iasecc_pin_policy {
 	int stored_length;
 	int tries_maximum;
 	int tries_remaining;
+	int read_verify_only;
 	unsigned char scbs[IASECC_MAX_SCBS];
 };
 
 static int iasecc_select_file(struct sc_card *card, const struct sc_path *path, struct sc_file **file_out);
+static int iasecc_finish(struct sc_card *card);
+static int iasecc_card_reader_lock_obtained(struct sc_card *card, int was_reset);
 static int iasecc_process_fci(struct sc_card *card, struct sc_file *file, const unsigned char *buf, size_t buflen);
 static int iasecc_get_serialnr(struct sc_card *card, struct sc_serial_number *serial);
 static int iasecc_sdo_get_data(struct sc_card *card, struct iasecc_sdo *sdo);
+static int iasecc_sdo_get_tagged_data(struct sc_card *card, int sdo_tag, struct iasecc_sdo *sdo);
 static int iasecc_pin_get_policy (struct sc_card *card, struct sc_pin_cmd_data *data, struct iasecc_pin_policy *pin);
 static int iasecc_pin_get_status(struct sc_card *card, struct sc_pin_cmd_data *data);
 static int iasecc_pin_get_info(struct sc_card *card, struct sc_pin_cmd_data *data);
@@ -353,6 +360,10 @@ iasecc_match_card(struct sc_card *card)
 {
 	struct sc_context *ctx = card->ctx;
 	int i;
+	if (iasecc_chipdoc_opted_in(card)) {
+		card->type = SC_CARD_TYPE_IASECC_CHIPDOC;
+		return 1; /* ATR/config candidate only; native metadata checked after bind. */
+	}
 
 	i = _sc_match_atr(card, iasecc_known_atrs, &card->type);
 	if (i < 0)   {
@@ -626,6 +637,8 @@ iasecc_init(struct sc_card *card)
 	struct iasecc_private_data *private_data = NULL;
 	int rv = SC_ERROR_NO_CARD_SUPPORT;
 	void *old_drv_data = card->drv_data;
+	if (card->type == SC_CARD_TYPE_IASECC_CHIPDOC)
+		return iasecc_chipdoc_initialize(card, iso_ops, iasecc_finish, iasecc_card_reader_lock_obtained);
 
 	LOG_FUNC_CALLED(ctx);
 	private_data = (struct iasecc_private_data *) calloc(1, sizeof(struct iasecc_private_data));
@@ -855,6 +868,24 @@ iasecc_emulate_fcp(struct sc_context *ctx, struct sc_apdu *apdu)
 }
 
 
+/* Only classify fixed public selection targets. Never log path bytes/lengths. */
+static unsigned long
+iasecc_trace_selection_target(const struct sc_path *path)
+{
+	static const unsigned char root[] = {0xF0,0x49,0x61,0x73,0x45,0x63,0x63,0x52,0x6F,0x6F,0x74};
+	static const unsigned char chipdoc[] = {0xE8,0x28,0xBD,0x08,0x0F,0xD2,0x50,0x47,0x65,0x6E,0x65,0x72,0x69,0x63};
+	if (path->type == SC_PATH_TYPE_DF_NAME) {
+		if (path->len == sizeof(root) && !memcmp(path->value, root, sizeof(root)))
+			return 2;
+		if (path->len == sizeof(chipdoc) && !memcmp(path->value, chipdoc, sizeof(chipdoc)))
+			return 3;
+		return 4;
+	}
+	if (path->len == 2 && path->value[0] == 0x3F && !path->value[1])
+		return 1;
+	return 0;
+}
+
 /* TODO: redesign using of cache
  * TODO: do not keep intermediate results in 'file_out' argument */
 static int
@@ -1000,8 +1031,14 @@ iasecc_select_file(struct sc_card *card, const struct sc_path *path,
 			apdu.le = 256;
 
 			rv = sc_transmit_apdu(card, &apdu);
+			if (card->type == SC_CARD_TYPE_IASECC_AMOS && rv < 0)
+				sc_api_metadata_trace(SC_API_CARD_SELECT, 0, (unsigned long)rv,
+						iasecc_trace_selection_target(&lpath), 0);
 			LOG_TEST_GOTO_ERR(ctx, rv, "APDU transmit failed");
 			rv = sc_check_sw(card, apdu.sw1, apdu.sw2);
+			if (card->type == SC_CARD_TYPE_IASECC_AMOS)
+				sc_api_metadata_trace(SC_API_CARD_SELECT, 0, (unsigned long)rv,
+						iasecc_trace_selection_target(&lpath), (apdu.sw1 << 8) | apdu.sw2);
 			if (rv == SC_ERROR_INCORRECT_PARAMETERS &&
 					lpath.type == SC_PATH_TYPE_DF_NAME && apdu.p2 == 0x00)   {
 				sc_log(ctx, "Warning: SC_ERROR_INCORRECT_PARAMETERS for SC_PATH_TYPE_DF_NAME, try again with P2=0x0C");
@@ -1097,10 +1134,10 @@ iasecc_process_fci(struct sc_card *card, struct sc_file *file,
 		 const unsigned char *buf, size_t buflen)
 {
 	struct sc_context *ctx = card->ctx;
-	size_t taglen, offs, ii;
+	size_t taglen, ii;
 	int rv;
-	const unsigned char *acls = NULL, *tag = NULL;
-	unsigned char mask;
+	const unsigned char *acls = NULL, *tag = NULL, *ops;
+	unsigned char mask, amb, scbs[IASECC_MAX_SCBS];
 	unsigned char ops_DF[7] = {
 		SC_AC_OP_DELETE, 0xFF, SC_AC_OP_ACTIVATE, SC_AC_OP_DEACTIVATE, 0xFF, SC_AC_OP_CREATE, 0xFF
 	};
@@ -1147,40 +1184,38 @@ iasecc_process_fci(struct sc_card *card, struct sc_file *file,
 	}
 
 	sc_log(ctx, "ACLs(%zu) '%s'", taglen, sc_dump_hex(acls, taglen));
-	mask = 0x40, offs = 1;
+	ops = file->type == SC_FILE_TYPE_DF ? ops_DF : ops_EF;
+	rv = iasecc_parse_compact_acls(acls, taglen, ops, &amb, scbs);
+	LOG_TEST_RET(ctx, rv, "Cannot parse compact ACL groups");
+	mask = 0x40;
 	for (ii = 0; ii < 7; ii++, mask /= 2)  {
 		unsigned char op = file->type == SC_FILE_TYPE_DF ? ops_DF[ii] : ops_EF[ii];
 
-		/* avoid any access to acls[offs] beyond the taglen */
-		if (offs >= taglen) {
-			sc_log(ctx, "Warning: Invalid offset reached during ACL parsing");
-			break;
-		}
-		if (!(mask & acls[0]))
+		if (!(mask & amb))
 			continue;
 
-		sc_log(ctx, "ACLs mask 0x%X, offs %zu, op 0x%X, acls[offs] 0x%X", mask, offs, op, acls[offs]);
+		sc_log(ctx, "ACLs mask 0x%X, op 0x%X, scb 0x%X", mask, op, scbs[ii]);
 		if (op == 0xFF)   {
-			;
+			continue;
 		}
-		else if (acls[offs] == 0)   {
-			sc_file_add_acl_entry(file, op, SC_AC_NONE, 0);
+		else if (scbs[ii] == 0)   {
+			rv = sc_file_add_acl_entry(file, op, SC_AC_NONE, 0);
 		}
-		else if (acls[offs] == 0xFF)   {
-			sc_file_add_acl_entry(file, op, SC_AC_NEVER, 0);
+		else if (scbs[ii] == 0xFF)   {
+			rv = sc_file_add_acl_entry(file, op, SC_AC_NEVER, 0);
 		}
-		else if ((acls[offs] & IASECC_SCB_METHOD_MASK) == IASECC_SCB_METHOD_USER_AUTH)   {
-			sc_file_add_acl_entry(file, op, SC_AC_SEN, acls[offs] & IASECC_SCB_METHOD_MASK_REF);
+		else if ((scbs[ii] & IASECC_SCB_METHOD_MASK) == IASECC_SCB_METHOD_USER_AUTH)   {
+			rv = sc_file_add_acl_entry(file, op, SC_AC_SEN, scbs[ii] & IASECC_SCB_METHOD_MASK_REF);
 		}
-		else if (acls[offs] & IASECC_SCB_METHOD_MASK)   {
-			sc_file_add_acl_entry(file, op, SC_AC_SCB, acls[offs]);
+		else if (scbs[ii] & IASECC_SCB_METHOD_MASK)   {
+			rv = sc_file_add_acl_entry(file, op, SC_AC_SCB, scbs[ii]);
 		}
 		else   {
-			sc_log(ctx, "Warning: non supported SCB method: %X", acls[offs]);
-			sc_file_add_acl_entry(file, op, SC_AC_NEVER, 0);
+			sc_log(ctx, "Warning: non supported SCB method: %X", scbs[ii]);
+			rv = sc_file_add_acl_entry(file, op, SC_AC_NEVER, 0);
 		}
 
-		offs++;
+		LOG_TEST_RET(ctx, rv, "Cannot add file ACL entry");
 	}
 
 	LOG_FUNC_RETURN(ctx, 0);
@@ -1386,14 +1421,41 @@ iasecc_get_challenge(struct sc_card *card, u8 * rnd, size_t len)
 }
 
 
+/* Keep the binding separate from the ephemeral session. A failed/reset
+ * session must never make a future ChipDoc dispatcher fall back to plain IAS. */
+void
+iasecc_chipdoc_invalidate_card(struct sc_card *card)
+{
+	struct iasecc_private_data *prv = card ? card->drv_data : NULL;
+	int active;
+	if (!prv)
+		return;
+	active = prv->chipdoc_profile != IASECC_CHIPDOC_NONE ||
+		prv->chipdoc_session.profile != IASECC_CHIPDOC_NONE || prv->chipdoc_session.channel != NULL ||
+		prv->chipdoc_transaction.active;
+	iasecc_chipdoc_invalidate(&prv->chipdoc_session);
+	if (active) {
+		sc_invalidate_cache(card);
+		sc_mem_clear(&prv->security_env, sizeof(prv->security_env));
+		prv->key_size = 0;
+		prv->op_method = prv->op_ref = 0;
+	}
+}
+
 static int
 iasecc_logout(struct sc_card *card)
 {
 	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = card->drv_data;
 	struct sc_path path;
 	int rv;
 
 	LOG_FUNC_CALLED(ctx);
+	if (prv && prv->chipdoc_transaction.active)
+		return iasecc_chipdoc_transaction_close(card, NULL);
+	iasecc_chipdoc_invalidate_card(card);
+	if (prv && prv->chipdoc_profile != IASECC_CHIPDOC_NONE)
+		return SC_SUCCESS;
 	if (!card->ef_atr || !card->ef_atr->aid.len)
 		return SC_SUCCESS;
 
@@ -1415,8 +1477,12 @@ iasecc_finish(struct sc_card *card)
 	struct sc_context *ctx = card->ctx;
 	struct iasecc_private_data *private_data = (struct iasecc_private_data *)card->drv_data;
 	struct iasecc_se_info *se_info = private_data->se_info, *next;
+	int close_result = SC_SUCCESS;
 
 	LOG_FUNC_CALLED(ctx);
+	if (private_data->chipdoc_transaction.active)
+		close_result = iasecc_chipdoc_transaction_close(card, NULL);
+	iasecc_chipdoc_invalidate_card(card);
 
 	sc_invalidate_cache(card);
 
@@ -1430,7 +1496,7 @@ iasecc_finish(struct sc_card *card)
 	free(card->drv_data);
 	card->drv_data = NULL;
 
-	LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+	LOG_FUNC_RETURN(ctx, close_result);
 }
 
 
@@ -1492,10 +1558,31 @@ iasecc_check_sw(struct sc_card *card, unsigned int sw1, unsigned int sw2)
 }
 
 
+static int
+iasecc_is_chipdoc_signing_key(struct sc_card *card, const struct sc_security_env *env)
+{
+	static const unsigned char aid[] = {
+		0xE8,0x28,0xBD,0x08,0x0F,0xD2,0x50,0x47,0x65,0x6E,0x65,0x72,0x69,0x63
+	};
+	struct iasecc_private_data *prv = card->drv_data;
+	const struct sc_path *path;
+
+	if (card->type != SC_CARD_TYPE_IASECC_AMOS || !env || !prv ||
+			!prv->cache.valid || !prv->cache.current_df ||
+			env->algorithm != SC_ALGORITHM_RSA || env->key_size_bits != 2048 ||
+			!(env->flags & SC_SEC_ENV_KEY_REF_PRESENT) || env->key_ref_len != 1 ||
+			(env->key_ref[0] & ~IASECC_OBJECT_REF_LOCAL) != 3)
+		return 0;
+	path = &prv->cache.current_df->path;
+	return path->type == SC_PATH_TYPE_DF_NAME && path->len == sizeof(aid) &&
+			!memcmp(path->value, aid, sizeof(aid));
+}
+
 static unsigned
-iasecc_get_algorithm(struct sc_context *ctx, const struct sc_security_env *env,
+iasecc_get_algorithm(struct sc_card *card, const struct sc_security_env *env,
 		unsigned operation, unsigned mechanism)
 {
+    struct sc_context *ctx = card->ctx;
     const struct sc_supported_algo_info *info = NULL;
     int ii;
 
@@ -1516,7 +1603,22 @@ iasecc_get_algorithm(struct sc_context *ctx, const struct sc_security_env *env,
         sc_log(ctx, "cannot find IAS/ECC algorithm (operation:%X,mechanism:%X)", operation, mechanism);
     }
 
-    return info ? info->algo_ref : 0;
+    if (info)
+        return info->algo_ref;
+
+    /* ChipDoc omits supportedAlgorithms. These three MSE references were
+     * accepted on the observed signing SDO. Do not replace a declared table
+     * or infer other mechanisms, keys, applications or card profiles.
+     */
+    if (!env->supported_algos[0].reference && iasecc_is_chipdoc_signing_key(card, env)) {
+        if (operation == SC_PKCS15_ALGO_OP_HASH && mechanism == CKM_SHA256)
+            return IASECC_ALGORITHM_SHA2;
+        if (operation == SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE && mechanism == CKM_SHA256_RSA_PKCS)
+            return IASECC_ALGORITHM_RSA_PKCS | IASECC_ALGORITHM_SHA2;
+        if (operation == SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE && mechanism == CKM_RSA_PKCS)
+            return IASECC_ALGORITHM_RSA_PKCS;
+    }
+    return 0;
 }
 
 
@@ -1666,6 +1768,7 @@ iasecc_set_security_env(struct sc_card *card,
 	unsigned algo_ref;
 	struct sc_apdu apdu;
 	unsigned sign_meth, sign_ref, auth_meth, auth_ref;
+	unsigned decipher_meth = SC_AC_NEVER, decipher_ref = SC_AC_NEVER;
 	unsigned long aflags;
 	unsigned char cse_crt_at[] = {
 		0x84, 0x01, 0xFF,
@@ -1683,6 +1786,7 @@ iasecc_set_security_env(struct sc_card *card,
 		0x80, 0x01, (IASECC_ALGORITHM_RSA_PKCS_DECRYPT | IASECC_ALGORITHM_SHA1)
 	};
 	int rv, operation = env->operation;
+	int chipdoc = iasecc_is_chipdoc_signing_key(card, env);
 
 	/* TODO: take algorithm references from 5032, not from header file. */
 	LOG_FUNC_CALLED(ctx);
@@ -1692,20 +1796,31 @@ iasecc_set_security_env(struct sc_card *card,
 	memset(&sdo, 0, sizeof(sdo));
 	sdo.sdo_class = IASECC_SDO_CLASS_RSA_PRIVATE;
 	sdo.sdo_ref  = env->key_ref[0] & ~IASECC_OBJECT_REF_LOCAL;
-	rv = iasecc_sdo_get_data(card, &sdo);
-	LOG_TEST_RET(ctx, rv, "Cannot get RSA PRIVATE SDO data");
-
-	if (sdo.docp.size.size < 2)
-		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_DATA);
-	/* To made by iasecc_sdo_convert_to_file() */
-	prv->key_size = *(sdo.docp.size.value + 0) * 0x100 + *(sdo.docp.size.value + 1);
+	/* The observed signing operation needs only public DOCP size/ACLs,
+	 * never the RSA private-component template 7F48.
+	 */
+	rv = chipdoc ? iasecc_sdo_get_tagged_data(card, IASECC_DOCP_TAG, &sdo) :
+			iasecc_sdo_get_data(card, &sdo);
+	if (chipdoc)
+		sc_api_metadata_trace(SC_API_CARD_KEY_DOCP, 0, (unsigned long)rv, sdo.sdo_ref, 0);
+	if (rv >= 0) {
+		if (sdo.docp.size.size < 2 || (chipdoc && sdo.docp.size.size != 2)) {
+			rv = SC_ERROR_INVALID_DATA;
+		} else {
+			prv->key_size = sdo.docp.size.value[0] * 0x100 + sdo.docp.size.value[1];
+			if (chipdoc && prv->key_size != 256)
+				rv = SC_ERROR_INVALID_DATA;
+		}
+	}
+	if (rv >= 0)
+		rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_PSO_COMPUTE_SIGNATURE, &sign_meth, &sign_ref);
+	if (rv >= 0)
+		rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_INTERNAL_AUTHENTICATE, &auth_meth, &auth_ref);
+	if (rv >= 0 && operation == SC_SEC_OPERATION_DECIPHER)
+		rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_PSO_DECRYPT, &decipher_meth, &decipher_ref);
+	iasecc_sdo_free_fields(card, &sdo);
+	LOG_TEST_RET(ctx, rv, "Cannot prepare RSA SDO size and access conditions");
 	sc_log(ctx, "prv->key_size 0x%zX", prv->key_size);
-
-	rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_PSO_COMPUTE_SIGNATURE, &sign_meth, &sign_ref);
-	LOG_TEST_RET(ctx, rv, "Cannot convert SC_AC_OP_SIGN acl");
-
-	rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_INTERNAL_AUTHENTICATE, &auth_meth, &auth_ref);
-	LOG_TEST_RET(ctx, rv, "Cannot convert SC_AC_OP_INT_AUTH acl");
 
 	aflags = env->algorithm_flags;
 
@@ -1743,27 +1858,27 @@ iasecc_set_security_env(struct sc_card *card,
 			LOG_TEST_RET(ctx, SC_ERROR_INVALID_ARGUMENTS, "Need RSA_PKCS1 specified");
 
 		if (env->algorithm_flags & SC_ALGORITHM_RSA_HASH_SHA256)   {
-			algo_ref = iasecc_get_algorithm(ctx, env, SC_PKCS15_ALGO_OP_HASH, CKM_SHA256);
+			algo_ref = iasecc_get_algorithm(card, env, SC_PKCS15_ALGO_OP_HASH, CKM_SHA256);
 			if (!algo_ref)
 				LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Card application do not supports HASH:SHA256");
 
 			cse_crt_ht[2] = algo_ref; /* IASECC_ALGORITHM_SHA2 */
 
-			algo_ref = iasecc_get_algorithm(ctx, env, SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE,  CKM_SHA256_RSA_PKCS);
+			algo_ref = iasecc_get_algorithm(card, env, SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE,  CKM_SHA256_RSA_PKCS);
 			if (!algo_ref)
-				LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Card application do not supports SIGNATURE:SHA1_RSA_PKCS");
+				LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Card application does not support SIGNATURE:SHA256_RSA_PKCS");
 
 			cse_crt_dst[2] = env->key_ref[0] | IASECC_OBJECT_REF_LOCAL;
 			cse_crt_dst[5] = algo_ref;   /* IASECC_ALGORITHM_RSA_PKCS | IASECC_ALGORITHM_SHA2 */
 		}
 		else if (env->algorithm_flags & SC_ALGORITHM_RSA_HASH_SHA1)   {
-			algo_ref = iasecc_get_algorithm(ctx, env, SC_PKCS15_ALGO_OP_HASH,  CKM_SHA_1);
+			algo_ref = iasecc_get_algorithm(card, env, SC_PKCS15_ALGO_OP_HASH,  CKM_SHA_1);
 			if (!algo_ref)
 				LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Card application do not supports HASH:SHA1");
 
 			cse_crt_ht[2] = algo_ref;	/* IASECC_ALGORITHM_SHA1 */
 
-			algo_ref = iasecc_get_algorithm(ctx, env, SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE,  CKM_SHA1_RSA_PKCS);
+			algo_ref = iasecc_get_algorithm(card, env, SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE,  CKM_SHA1_RSA_PKCS);
 			if (!algo_ref)
 				LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Card application do not supports SIGNATURE:SHA1_RSA_PKCS");
 
@@ -1790,7 +1905,7 @@ iasecc_set_security_env(struct sc_card *card,
 		apdu.lc = sizeof(cse_crt_dst);
 		break;
 	case SC_SEC_OPERATION_AUTHENTICATE:
-		algo_ref = iasecc_get_algorithm(ctx, env, SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE,  CKM_RSA_PKCS);
+		algo_ref = iasecc_get_algorithm(card, env, SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE,  CKM_RSA_PKCS);
 		if (!algo_ref)
 			LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Application do not supports SIGNATURE:RSA_PKCS");
 
@@ -1803,9 +1918,9 @@ iasecc_set_security_env(struct sc_card *card,
 		apdu.lc = sizeof(cse_crt_at);
 		break;
 	case SC_SEC_OPERATION_DECIPHER:
-		rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_PSO_DECRYPT, &prv->op_method, &prv->op_ref);
-		LOG_TEST_RET(ctx, rv, "Cannot convert SC_AC_OP_PSO_DECRYPT acl");
-		algo_ref = iasecc_get_algorithm(ctx, env, SC_PKCS15_ALGO_OP_DECIPHER,  CKM_RSA_PKCS);
+		prv->op_method = decipher_meth;
+		prv->op_ref = decipher_ref;
+		algo_ref = iasecc_get_algorithm(card, env, SC_PKCS15_ALGO_OP_DECIPHER,  CKM_RSA_PKCS);
 		if (!algo_ref)
 			LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Application do not supports DECIPHER:RSA_PKCS");
 
@@ -1824,6 +1939,8 @@ iasecc_set_security_env(struct sc_card *card,
 	rv = sc_transmit_apdu(card, &apdu);
 	LOG_TEST_RET(ctx, rv, "APDU transmit failed");
 	rv = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	sc_api_metadata_trace(SC_API_CARD_MSE, 0, (unsigned long)rv,
+			((unsigned long)apdu.sw1 << 8) | apdu.sw2, operation);
 	LOG_TEST_RET(ctx, rv, "MSE restore error");
 
 	prv->security_env = *env;
@@ -1919,6 +2036,113 @@ iasecc_pin_get_status(struct sc_card *card, struct sc_pin_cmd_data *data)
 
 
 static int
+iasecc_chipdoc_post_login_probe(struct sc_card *card,
+		const struct sc_pin_cmd_data *verified, const struct iasecc_pin_policy *policy)
+{
+	static const unsigned char aid[] = {
+		0xE8,0x28,0xBD,0x08,0x0F,0xD2,0x50,0x47,0x65,0x6E,0x65,0x72,0x69,0x63
+	};
+	const char *experiment = getenv("OPENSC_JCOP3_POST_LOGIN_STATUS");
+	const char *select_experiment = getenv("OPENSC_JCOP3_POST_LOGIN_SELECT");
+	struct sc_pin_cmd_data status;
+	struct sc_path root;
+	int query_status = experiment && !strcmp(experiment, "yes");
+	int query_select = select_experiment && !strcmp(select_experiment, "yes");
+	int i, rv;
+
+	/* Temporary experiment, called only after an actual successful VERIFY.
+	 * Isolate either one empty VERIFY or one root SELECT. No policy reads,
+	 * credential copies or retries. The two experiments cannot be combined.
+	 * The parsed policy marker is deliberately not assigned a meaning.
+	 */
+	if ((!query_status && !query_select) ||
+			card->type != SC_CARD_TYPE_IASECC_AMOS || !policy->read_verify_only ||
+			verified->cmd != SC_PIN_CMD_VERIFY || verified->pin_type != SC_AC_CHV ||
+			verified->pin_reference != 1)
+		return SC_SUCCESS;
+	for (i = 0; i < card->app_count && i < SC_MAX_CARD_APPS; i++) {
+		if (card->app[i] && card->app[i]->aid.len == sizeof(aid) &&
+				!memcmp(card->app[i]->aid.value, aid, sizeof(aid)))
+			break;
+	}
+	if (i >= card->app_count || i >= SC_MAX_CARD_APPS)
+		return SC_SUCCESS;
+	if (query_status && query_select)
+		return SC_ERROR_INVALID_ARGUMENTS;
+	if (query_select) {
+		/* Same root AID selected by the observed MF/GET INFO path. */
+		sc_format_path("F0496173456363526F6F74", &root);
+		root.type = SC_PATH_TYPE_DF_NAME;
+		sc_api_metadata_trace(SC_API_POST_LOGIN_SELECT_BEGIN, 0, 0, 2, 0);
+		rv = iasecc_select_file(card, &root, NULL);
+		sc_api_metadata_trace(SC_API_POST_LOGIN_SELECT, 0, (unsigned long)rv, 2, 0);
+		return rv;
+	}
+
+	memset(&status, 0, sizeof(status));
+	status.cmd = SC_PIN_CMD_GET_INFO;
+	status.pin_type = SC_AC_CHV;
+	status.pin_reference = 1;
+	sc_api_metadata_trace(SC_API_POST_LOGIN_STATUS_BEGIN, 0, 0, 1, 0);
+	rv = iasecc_pin_get_status(card, &status);
+	sc_api_metadata_trace(SC_API_POST_LOGIN_STATUS, 0, (unsigned long)rv,
+			status.pin1.logged_in, 0);
+	return rv;
+}
+
+
+static int
+iasecc_chipdoc_fresh_verify(struct sc_card *card, const struct sc_pin_cmd_data *data)
+{
+	static const unsigned char aid[] = {
+		0xE8,0x28,0xBD,0x08,0x0F,0xD2,0x50,0x47,0x65,0x6E,0x65,0x72,0x69,0x63
+	};
+	const char *experiment = getenv("OPENSC_JCOP3_PIN_STATUS_IN_PLACE");
+	int i;
+
+	/* Empty VERIFY can still report an authenticated CHV after a root
+	 * selection has invalidated permission for the observed RSA operation.
+	 * In the opt-in candidate, an explicit VERIFY must reach the card;
+	 * neither consult nor populate the legacy verified-PIN hash shortcut.
+	 * The normal policy read/validation remains before the actual VERIFY.
+	 */
+	if (!experiment || strcmp(experiment, "yes") ||
+			card->type != SC_CARD_TYPE_IASECC_AMOS || data->cmd != SC_PIN_CMD_VERIFY ||
+			data->pin_type != SC_AC_CHV || data->pin_reference != 1)
+		return 0;
+	for (i = 0; i < card->app_count && i < SC_MAX_CARD_APPS; i++)
+		if (card->app[i] && card->app[i]->aid.len == sizeof(aid) &&
+				!memcmp(card->app[i]->aid.value, aid, sizeof(aid)))
+			return 1;
+	return 0;
+}
+
+
+static int
+iasecc_chipdoc_select_for_verify(struct sc_card *card,
+		const struct sc_pin_cmd_data *data, const struct iasecc_pin_policy *policy)
+{
+	struct sc_path path;
+	int rv;
+
+	if (!policy->read_verify_only || !iasecc_chipdoc_fresh_verify(card, data))
+		return SC_SUCCESS;
+
+	/* A different client can select the IAS root while this application's
+	 * PIN dialog is open. Root VERIFY may succeed without restoring the
+	 * observed RSA permission. In the opt-in candidate, establish ChipDoc
+	 * after all root/policy selections and before the actual VERIFY. Never
+	 * recover by replaying a PIN after a failed signature.
+	 */
+	sc_format_path("E828BD080FD25047656E65726963", &path);
+	path.type = SC_PATH_TYPE_DF_NAME;
+	rv = iasecc_select_file(card, &path, NULL);
+	sc_api_metadata_trace(SC_API_PRE_VERIFY_SELECT, 0, (unsigned long)rv, 3, 0);
+	return rv;
+}
+
+
+static int
 iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 {
 	struct sc_context *ctx = card->ctx;
@@ -1927,6 +2151,7 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 	struct sc_pin_cmd_data pin_cmd;
 	struct iasecc_pin_policy policy;
 	int tries_before_verify = -1;
+	int fresh_verify = iasecc_chipdoc_fresh_verify(card, data);
 	int rv;
 
 	LOG_FUNC_CALLED(ctx);
@@ -1966,9 +2191,11 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 		LOG_FUNC_RETURN(ctx, rv);
 
 	if (!rv)   {
-		if (pin_cmd.pin1.logged_in & SC_PIN_STATE_LOGGED_IN)
-			if (iasecc_chv_cache_is_verified(card, &pin_cmd))
+		if (!fresh_verify && (pin_cmd.pin1.logged_in & SC_PIN_STATE_LOGGED_IN))
+			if (iasecc_chv_cache_is_verified(card, &pin_cmd)) {
+				sc_api_metadata_trace(SC_API_CARD_PIN_VERIFY_CACHED, 0, 0, reference, 0);
 				LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+			}
 	}
 	else if (rv != SC_ERROR_SECURITY_STATUS_NOT_SATISFIED)   {
 		LOG_FUNC_RETURN(ctx, rv);
@@ -1986,7 +2213,11 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 			iasecc_set_pin_padding(&pin_cmd, &pin_cmd.pin1, policy.stored_length);
 	}
 
+	rv = iasecc_chipdoc_select_for_verify(card, &pin_cmd, &policy);
+	LOG_TEST_RET(ctx, rv, "Cannot select ChipDoc before VERIFY");
+
 	rv = iasecc_chv_verify(card, &pin_cmd, policy.scbs);
+	sc_api_metadata_trace(SC_API_CARD_PIN_VERIFY, 0, (unsigned long)rv, reference, 0);
 
 	/*
 	 * Detect and log PIN-pads which don't handle variable-length PIN - special case where they
@@ -2003,7 +2234,11 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 
 	LOG_TEST_RET(ctx, rv, "PIN CHV verification error");
 
-	rv = iasecc_chv_cache_verified(card, &pin_cmd);
+	if (!fresh_verify) {
+		rv = iasecc_chv_cache_verified(card, &pin_cmd);
+		LOG_TEST_RET(ctx, rv, "Cannot record verified CHV");
+	}
+	rv = iasecc_chipdoc_post_login_probe(card, &pin_cmd, &policy);
 
 	LOG_FUNC_RETURN(ctx, rv);
 }
@@ -2071,6 +2306,7 @@ iasecc_pin_get_policy (struct sc_card *card, struct sc_pin_cmd_data *data, struc
 	sc_log(ctx, "iasecc_pin_get_policy() sdo.docp.size.size %zu", sdo.docp.size.size);
 
 	memcpy(pin->scbs, sdo.docp.scbs, sizeof(pin->scbs));
+	pin->read_verify_only = sdo.docp.chipdoc_c9.value != NULL;
 
 	pin->min_length = (sdo.data.chv.size_min.value ? *sdo.data.chv.size_min.value : -1);
 	pin->max_length = (sdo.data.chv.size_max.value ? *sdo.data.chv.size_max.value : -1);
@@ -2101,6 +2337,9 @@ iasecc_pin_get_policy (struct sc_card *card, struct sc_pin_cmd_data *data, struc
 		rv = iasecc_select_file(card, &save_current_ef->path, NULL);
 		LOG_TEST_GOTO_ERR(ctx, rv, "Cannot return to saved EF");
 	}
+	if (card->type == SC_CARD_TYPE_IASECC_AMOS && data->pin_reference == 1)
+		prv->chipdoc_pin_max_tries = pin->read_verify_only && pin->tries_maximum > 0
+				? pin->tries_maximum : 0;
 
 err:
 	sc_file_free(save_current_df);
@@ -2114,11 +2353,23 @@ static int
 iasecc_pin_get_info(struct sc_card *card, struct sc_pin_cmd_data *data)
 {
 	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = card->drv_data;
 	struct iasecc_pin_policy policy;
 	int rv;
 
 	LOG_FUNC_CALLED(ctx);
 	sc_log(ctx, "iasecc_pin_get_info(card:%p)", card);
+	if (card->type == SC_CARD_TYPE_IASECC_AMOS)
+		sc_api_metadata_trace(SC_API_CARD_PIN_INFO_BEGIN, 0, 0, data->pin_reference, 0);
+	if (data->flags & SC_PIN_CMD_STATUS_ONLY) {
+		if (card->type != SC_CARD_TYPE_IASECC_AMOS || data->pin_type != SC_AC_CHV ||
+				data->pin_reference != 1 || !prv || prv->chipdoc_pin_max_tries <= 0)
+			return SC_ERROR_NOT_SUPPORTED;
+		rv = iasecc_pin_get_status(card, data);
+		if (rv == SC_SUCCESS)
+			data->pin1.max_tries = prv->chipdoc_pin_max_tries;
+		return rv;
+	}
 
 	/*
 	 * Get PIN status first and thereafter update with info from PIN policy, when available.
@@ -2127,9 +2378,13 @@ iasecc_pin_get_info(struct sc_card *card, struct sc_pin_cmd_data *data)
 	 * policy takes precedence.
 	 */
 	rv = iasecc_pin_get_status(card, data);
+	if (card->type == SC_CARD_TYPE_IASECC_AMOS)
+		sc_api_metadata_trace(SC_API_CARD_PIN_INFO, 0, (unsigned long)rv, data->pin1.logged_in, 1);
 	LOG_TEST_RET(ctx, rv, "Failed to get PIN status");
 
 	rv = iasecc_pin_get_policy(card, data, &policy);
+	if (card->type == SC_CARD_TYPE_IASECC_AMOS)
+		sc_api_metadata_trace(SC_API_CARD_PIN_INFO, 0, (unsigned long)rv, data->pin1.logged_in, 2);
 	LOG_TEST_RET(ctx, rv, "Failed to get PIN policy");
 
 	/*
@@ -2302,6 +2557,13 @@ iasecc_pin_change(struct sc_card *card, struct sc_pin_cmd_data *data)
 		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
 	}
 
+	if (card->type == SC_CARD_TYPE_IASECC_AMOS && data->pin_reference == 1) {
+		rv = iasecc_pin_get_policy(card, data, &policy);
+		LOG_TEST_RET(ctx, rv, "Failed to get PIN policy");
+		if (policy.read_verify_only)
+			LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	}
+
 	/*
 	 * Verify the original PIN. This would normally not be needed since it is implicitly done
 	 * by the card when executing a PIN change command. But we must go through our verification
@@ -2373,6 +2635,9 @@ iasecc_pin_reset(struct sc_card *card, struct sc_pin_cmd_data *data)
 
 	rv = iasecc_pin_get_policy(card, data, &policy);
 	LOG_TEST_RET(ctx, rv, "Failed to get PIN policy");
+
+	if (policy.read_verify_only)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
 
 	scb = policy.scbs[IASECC_ACLS_CHV_RESET];
 	do   {
@@ -3357,8 +3622,12 @@ iasecc_compute_signature_at(struct sc_card *card,
 	apdu.le = 0x100;
 
 	rv = sc_transmit_apdu(card, &apdu);
+	if (rv < 0)
+		sc_api_metadata_trace(SC_API_CARD_SIGN_AT, 0, (unsigned long)rv, 0, 0);
 	LOG_TEST_RET(ctx, rv, "APDU transmit failed");
 	rv = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	sc_api_metadata_trace(SC_API_CARD_SIGN_AT, 0, (unsigned long)rv,
+			((unsigned long)apdu.sw1 << 8) | apdu.sw2, 0);
 	LOG_TEST_RET(ctx, rv, "Compute signature failed");
 
 	do   {
@@ -3586,6 +3855,33 @@ iasecc_get_free_reference(struct sc_card *card, struct iasecc_ctl_get_free_refer
 }
 
 
+/* Reset notifications discard this profile's local operation state. Managed
+ * reservations also detect physical reacquisition; legacy/raw profiles retain
+ * ordinary locking behavior. Explicit reset invalidates before reader I/O. */
+static int
+iasecc_card_reader_lock_obtained(struct sc_card *card, int was_reset)
+{
+	struct iasecc_private_data *prv;
+	if (!card || !card->drv_data)
+		return SC_SUCCESS;
+	prv = card->drv_data;
+	/* This hook runs only on a NEW physical reader transaction. If our
+	 * reservation was live, its original lock was lost, even without reset.
+	 * Never release the newly acquired caller's lock as if it were ours. */
+	if (prv->chipdoc_transaction.active) {
+		prv->chipdoc_transaction.lost = 1;
+		prv->chipdoc_transaction.owned_lock = 0;
+		prv->chipdoc_recovery_required = 1;
+		iasecc_chipdoc_invalidate_card(card);
+		return SC_SUCCESS;
+	}
+	if (was_reset && (prv->chipdoc_profile != IASECC_CHIPDOC_NONE || prv->chipdoc_session.profile != IASECC_CHIPDOC_NONE ||
+			prv->chipdoc_session.channel)) {
+		iasecc_chipdoc_invalidate_card(card);
+	}
+	return SC_SUCCESS;
+}
+
 static struct sc_card_driver *
 sc_get_driver(void)
 {
@@ -3629,6 +3925,7 @@ sc_get_driver(void)
 	/*	delete_record: Not implemented	*/
 
 	iasecc_ops.read_public_key = iasecc_read_public_key;
+	iasecc_ops.card_reader_lock_obtained = iasecc_card_reader_lock_obtained;
 
 	return &iasecc_drv;
 }

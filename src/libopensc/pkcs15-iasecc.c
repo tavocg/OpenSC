@@ -144,8 +144,128 @@ _iasecc_cpx_fixup_prkdf(struct sc_pkcs15_card *p15card)
 }
 
 
+static int
+_iasecc_is_chipdoc(struct sc_pkcs15_card *p15card)
+{
+	static const unsigned char generic_aid[] = {
+		0xE8, 0x28, 0xBD, 0x08, 0x0F, 0xD2, 0x50,
+		0x47, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63
+	};
+
+	return p15card->card->type == SC_CARD_TYPE_IASECC_AMOS && p15card->app &&
+			p15card->app->aid.len == sizeof(generic_aid) &&
+			!memcmp(p15card->app->aid.value, generic_aid, sizeof(generic_aid));
+}
+
+/* ChipDoc's AODF describes global CHV 1 with path 0001, but that EF is
+ * absent. The observed CHV 1 is accessible in MF.
+ * Keep the correction separate from ordinary file selection, and restrict it
+ * to the IAS/ECC Amos / Generic PKI profile and the affected PIN metadata.
+ */
+static void
+_iasecc_fixup_global_pin_paths(struct sc_pkcs15_card *p15card)
+{
+	struct sc_pkcs15_object *obj;
+
+	if (!_iasecc_is_chipdoc(p15card))
+		return;
+
+	for (obj = p15card->obj_list; obj; obj = obj->next) {
+		struct sc_pkcs15_auth_info *info;
+
+		if (obj->type != SC_PKCS15_TYPE_AUTH_PIN || !obj->data)
+			continue;
+		info = obj->data;
+		if (info->auth_type != SC_PKCS15_PIN_AUTH_TYPE_PIN ||
+				info->attrs.pin.reference != 1 ||
+				(info->attrs.pin.flags & SC_PKCS15_PIN_FLAG_LOCAL) ||
+				(info->path.type != SC_PATH_TYPE_PATH && info->path.type != SC_PATH_TYPE_FILE_ID) ||
+				info->path.len != 2 || info->path.value[0] != 0 || info->path.value[1] != 1)
+			continue;
+		if (info->path.aid.len && (info->path.aid.len != p15card->app->aid.len ||
+				memcmp(info->path.aid.value, p15card->app->aid.value, info->path.aid.len)))
+			continue;
+
+		sc_format_path("3F00", &info->path);
+		info->path.type = SC_PATH_TYPE_FILE_ID;
+		sc_log(p15card->card->ctx, "ChipDoc: use MF for global CHV 1 instead of path 0001");
+	}
+}
+
+/* The observed signing key is a native RSA SDO in ChipDoc, not an EF 0003.
+ * Keep the AID and key reference, selecting the application before MSE.
+ * Other keys and profiles retain their original PKCS#15 paths.
+ */
+static void
+_iasecc_fixup_signing_key_paths(struct sc_pkcs15_card *p15card)
+{
+	struct sc_pkcs15_object *obj;
+
+	if (!_iasecc_is_chipdoc(p15card))
+		return;
+	for (obj = p15card->obj_list; obj; obj = obj->next) {
+		struct sc_pkcs15_prkey_info *info;
+
+		if (obj->type != SC_PKCS15_TYPE_PRKEY_RSA || !obj->data)
+			continue;
+		info = obj->data;
+		if (!info->native || info->key_reference != 3 || info->modulus_length != 2048 ||
+				(info->path.type != SC_PATH_TYPE_PATH && info->path.type != SC_PATH_TYPE_FILE_ID) ||
+				info->path.len != 2 || info->path.value[0] != 0 || info->path.value[1] != 3 ||
+				info->path.aid.len != p15card->app->aid.len ||
+				memcmp(info->path.aid.value, p15card->app->aid.value, info->path.aid.len))
+			continue;
+
+		info->path.len = 0;
+		memset(info->path.value, 0, sizeof(info->path.value));
+		info->path.type = SC_PATH_TYPE_PATH;
+		sc_log(p15card->card->ctx, "ChipDoc: select the application for signing SDO 3 instead of EF 0003");
+	}
+}
+
+/* ChipDoc does not declare a combined hashing algorithm for its signing key.
+ * PKCS#11 therefore hashes in software. Do not send that digest through
+ * IAS/ECC QSign, which expects the message and has no OpenSSL 3 implementation.
+ * Let PKCS#15 prepend DigestInfo and use the verified RSA-PKCS AT operation.
+ * Keep declared algorithms, other profiles and other RSA sizes unchanged.
+ */
+static void
+_iasecc_fixup_signature_algorithms(struct sc_pkcs15_card *p15card)
+{
+	struct sc_pkcs15_object *obj;
+	struct sc_card *card = p15card->card;
+
+	if (!_iasecc_is_chipdoc(p15card) || !p15card->tokeninfo ||
+			p15card->tokeninfo->supported_algos[0].reference)
+		return;
+	for (obj = p15card->obj_list; obj; obj = obj->next) {
+		struct sc_pkcs15_prkey_info *info;
+
+		if (obj->type != SC_PKCS15_TYPE_PRKEY_RSA || !obj->data)
+			continue;
+		info = obj->data;
+		if (!info->native || info->key_reference != 3 || info->modulus_length != 2048 ||
+				!(info->usage & SC_PKCS15_PRKEY_USAGE_SIGN) || info->algo_refs[0] ||
+				info->path.type != SC_PATH_TYPE_PATH || info->path.len ||
+				info->path.aid.len != p15card->app->aid.len ||
+				memcmp(info->path.aid.value, p15card->app->aid.value, info->path.aid.len))
+			continue;
+
+		for (int i = 0; i < card->algorithm_count; i++) {
+			struct sc_algorithm_info *algo = &card->algorithms[i];
+			unsigned long required = SC_ALGORITHM_RSA_PAD_PKCS1_TYPE_01 |
+					SC_ALGORITHM_RSA_HASH_NONE;
+
+			if (algo->algorithm == SC_ALGORITHM_RSA && algo->key_length == 2048 &&
+					(algo->flags & required) == required &&
+					!(algo->flags & SC_ALGORITHM_RSA_RAW))
+				algo->flags &= ~SC_ALGORITHM_RSA_HASH_SHA256;
+		}
+	}
+}
+
 /*
- * It is the entry point for 2 models of cards that need some hot patching
+ * It is the entry point for models of cards that need some hot patching
  * - Gemalto cards
  * - CPx: fixup algo_refs from the prkey
  */
@@ -167,6 +287,13 @@ _iasecc_parse_df(struct sc_pkcs15_card *p15card, struct sc_pkcs15_df *df)
 
 	rv = sc_pkcs15_parse_df(p15card, df);
 	LOG_TEST_RET(ctx, rv, "DF parse error");
+
+	if (df->type == SC_PKCS15_AODF)
+		_iasecc_fixup_global_pin_paths(p15card);
+	if (df->type == SC_PKCS15_PRKDF) {
+		_iasecc_fixup_signing_key_paths(p15card);
+		_iasecc_fixup_signature_algorithms(p15card);
+	}
 
 	switch(p15card->card->type) {
 		/* enumerate the IASECC cards that need a fixup of the keyInfo */
@@ -256,8 +383,12 @@ sc_pkcs15emu_iasecc_init (struct sc_pkcs15_card *p15card, struct sc_aid *aid)
 	LOG_FUNC_CALLED(ctx);
 
 	rv = sc_pkcs15_bind_internal(p15card, aid);
+	LOG_TEST_RET(ctx, rv, "Cannot bind native IAS/ECC application");
 
 	p15card->ops.parse_df = _iasecc_parse_df;
+	_iasecc_fixup_global_pin_paths(p15card);
+	_iasecc_fixup_signing_key_paths(p15card);
+	_iasecc_fixup_signature_algorithms(p15card);
 
 	LOG_FUNC_RETURN(ctx, rv);
 }

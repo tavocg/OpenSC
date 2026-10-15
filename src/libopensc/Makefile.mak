@@ -24,7 +24,7 @@ OBJECTS			= \
 	card-asepcos.obj card-gemsafeV1.obj card-rutoken.obj \
 	card-rtecp.obj card-myeid.obj \
 	card-itacns.obj card-authentic.obj \
-	card-iasecc.obj iasecc-sdo.obj iasecc-sm.obj cwa-dnie.obj cwa14890.obj \
+	card-iasecc.obj iasecc-sdo.obj iasecc-sm.obj iasecc-chipdoc-sm.obj iasecc-chipdoc-bind.obj cwa-dnie.obj cwa14890.obj \
 	card-sc-hsm.obj card-dnie.obj card-isoApplet.obj pkcs15-coolkey.obj \
 	card-masktech.obj card-gids.obj card-jpki.obj \
 	card-npa.obj card-esteid2018.obj card-esteid2025.obj card-idprime.obj \

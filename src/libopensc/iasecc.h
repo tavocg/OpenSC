@@ -25,6 +25,7 @@
 #include "libopensc/errors.h"
 #include "libopensc/types.h"
 #include "libopensc/iasecc-sdo.h"
+#include "libopensc/iasecc-chipdoc.h"
 
 #define ISO7812_PAN_SN_TAG	0x5A
 
@@ -132,6 +133,17 @@ struct sc_card_cache {
 	int valid;
 };
 
+/* An extra sc_lock owned by the internal ChipDoc operation controller.
+ * The reader/context/card must outlive this reservation; callers serialize
+ * operations on one card. This is not a PIN cache or a thread mutex. */
+struct iasecc_chipdoc_transaction {
+	struct sc_card *card;
+	struct sc_reader *reader;
+	struct sc_context *context;
+	int active, owned_lock, lost, reset_required;
+	struct iasecc_chipdoc_pin_policy pin;
+};
+
 struct iasecc_private_data {
 	struct iasecc_version version;
 	struct iasecc_io_buffer_sizes max_sizes;
@@ -143,6 +155,29 @@ struct iasecc_private_data {
 	struct iasecc_se_info *se_info;
 
 	struct sc_card_cache cache;
+	/* Public fixed policy only; never cache login state or remaining tries here. */
+	int chipdoc_pin_max_tries;
+	/* Inactive until the separate ChipDoc adapter is connected to this driver. */
+	enum iasecc_chipdoc_profile_id chipdoc_profile;
+	struct iasecc_chipdoc_session chipdoc_session;
+	struct iasecc_chipdoc_transaction chipdoc_transaction;
+	int chipdoc_recovery_required;
+	struct iasecc_chipdoc_routing *chipdoc_routing;
+	int chipdoc_enabled;
 };
+
+/* Internal cleanup shared by lifecycle hooks and the future channel adapter. */
+void iasecc_chipdoc_invalidate_card(struct sc_card *card);
+void sc_invalidate_cache(struct sc_card *card);
+
+/* Scoped native post-bind hook; all other drivers/profiles stay unchanged. */
+static inline int
+iasecc_chipdoc_configured(const struct sc_card *card)
+{
+	return card && card->driver && card->driver->short_name && !strcmp(card->driver->short_name, "iasecc") &&
+		card->drv_data && ((const struct iasecc_private_data *)card->drv_data)->chipdoc_enabled;
+}
+struct sc_pkcs15_card;
+int iasecc_chipdoc_pkcs15_activate(struct sc_pkcs15_card *p15);
 
 #endif

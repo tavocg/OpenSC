@@ -40,6 +40,7 @@
 #endif
 
 #include "sc-pkcs11.h"
+#include "libopensc/iasecc.h"
 #ifdef USE_PKCS15_INIT
 #include "pkcs15init/pkcs15-init.h"
 #endif
@@ -287,6 +288,11 @@ pkcs15_bind(struct sc_pkcs11_card *p11card, struct sc_app_info *app_info)
 	sc_log(context, "Bind PKCS#15 '%s' application", app_info ? app_info->label : "<anonymous>");
 	if (!p11card)
 		return CKR_TOKEN_NOT_RECOGNIZED;
+	/* This measured profile owns its transaction and never stores/replays
+	 * credentials. The generic atomic/lock-login modes are incompatible. */
+	if (iasecc_chipdoc_configured(p11card->card) &&
+			(sc_pkcs11_conf.atomic || sc_pkcs11_conf.lock_login))
+		return CKR_FUNCTION_NOT_SUPPORTED;
 	for (idx=0; idx<SC_PKCS11_FRAMEWORK_DATA_MAX_NUM; idx++)
 		if (!p11card->fws_data[idx])
 			break;
@@ -494,6 +500,9 @@ __pkcs15_delete_object(struct pkcs15_fw_data *fw_data, struct pkcs15_any_object 
 }
 #endif
 
+static int pkcs15_chipdoc_session_state(struct sc_pkcs15_card *,
+		struct sc_pkcs15_auth_info *, int);
+
 CK_RV C_GetTokenInfo(CK_SLOT_ID slotID, CK_TOKEN_INFO_PTR pInfo)
 {
 	struct sc_pkcs11_slot *slot;
@@ -509,6 +518,7 @@ CK_RV C_GetTokenInfo(CK_SLOT_ID slotID, CK_TOKEN_INFO_PTR pInfo)
 	if (rv != CKR_OK)
 		return rv;
 	sc_log(context, "C_GetTokenInfo(%lx)", slotID);
+	sc_api_metadata_trace(SC_API_TOKEN_INFO_BEGIN, 0, CKR_OK, slotID, 0);
 
 	rv = slot_get_token(slotID, &slot);
 	if (rv != CKR_OK)   {
@@ -548,7 +558,18 @@ CK_RV C_GetTokenInfo(CK_SLOT_ID slotID, CK_TOKEN_INFO_PTR pInfo)
 			goto out;
 		}
 
-		sc_pkcs15_get_pin_info(p15card, auth);
+		if (pkcs15_chipdoc_session_state(p15card, pin_info, slot->login_user)) {
+			/* Experimental: flags below use cached public retry metadata.
+			 * This is not a new physical PIN-status observation.
+			 */
+			sc_api_metadata_trace(SC_API_TOKEN_PIN_CACHED, 0, CKR_OK,
+					SC_PIN_STATE_UNKNOWN, (CK_ULONG)slot->login_user);
+		} else {
+			/* Preserve the existing behavior: the PIN-query result does not set rv. */
+			int pin_rv = sc_pkcs15_get_pin_info(p15card, auth);
+			sc_api_metadata_trace(SC_API_TOKEN_PIN_STATUS, 0, (CK_RV)pin_rv,
+					pin_info->logged_in, (CK_ULONG)slot->login_user);
+		}
 
 		if (pin_info->tries_left >= 0) {
 			if (pin_info->tries_left == 1 || pin_info->max_tries == 1)
@@ -570,6 +591,7 @@ out:
 		sc_log(context, "C_GetTokenInfo(%lx) returns %s", slotID, name);
 	else
 		sc_log(context, "C_GetTokenInfo(%lx) returns 0x%08lX", slotID, rv);
+	sc_api_metadata_trace(SC_API_TOKEN_INFO, 0, rv, slotID, 0);
 	sc_pkcs11_unlock();
 
 	return rv;
@@ -858,8 +880,18 @@ pkcs15_create_pkcs11_objects(struct pkcs15_fw_data *fw_data, int p15_type, const
 	if (rv >= 0)
 		sc_log(context, "Found %d %s%s", count, name, (count == 1)? "" : "s");
 
-	for (i = 0; rv >= 0 && i < count; i++)
+	for (i = 0; rv >= 0 && i < count; i++) {
+		/* Native metadata may also contain authentication keys. This
+		 * signing-only profile exposes the validated measured key alone. */
+		if (iasecc_chipdoc_configured(fw_data->p15_card->card) &&
+				(p15_type & SC_PKCS15_TYPE_CLASS_MASK) == SC_PKCS15_TYPE_PRKEY) {
+			struct sc_pkcs15_prkey_info *info = p15_object[i]->data;
+			if (p15_object[i]->type != SC_PKCS15_TYPE_PRKEY_RSA || !info ||
+					info->key_reference != 0x91 || info->modulus_length != 2048)
+				continue;
+		}
 		rv = create(fw_data, p15_object[i], NULL);
+	}
 
 	return count;
 }
@@ -1105,7 +1137,8 @@ pkcs15_init_slot(struct sc_pkcs15_card *p15card, struct sc_pkcs11_slot *slot,
 	if (auth != NULL)
 		slot->token_info.flags |= CKF_USER_PIN_INITIALIZED;
 
-	if ((p15card->card->reader->capabilities & SC_READER_CAP_PIN_PAD) || (p15card->card->caps & SC_CARD_CAP_PROTECTED_AUTHENTICATION_PATH))
+	if (!iasecc_chipdoc_configured(p15card->card) &&
+			((p15card->card->reader->capabilities & SC_READER_CAP_PIN_PAD) || (p15card->card->caps & SC_CARD_CAP_PROTECTED_AUTHENTICATION_PATH)))
 		slot->token_info.flags |= CKF_PROTECTED_AUTHENTICATION_PATH;
 
 	if (p15card->card->caps & SC_CARD_CAP_RNG && p15card->card->ops->get_challenge != NULL)
@@ -1120,6 +1153,8 @@ pkcs15_init_slot(struct sc_pkcs15_card *p15card, struct sc_pkcs11_slot *slot,
 	if (atrblock) {
 		write_protected = scconf_get_bool(atrblock, "read_only", write_protected);
 	}
+	if (iasecc_chipdoc_configured(p15card->card))
+		write_protected = 1;
 	if (write_protected) {
 		slot->token_info.flags |= CKF_WRITE_PROTECTED;
 	}
@@ -1328,9 +1363,39 @@ _is_slot_auth_object(struct sc_pkcs15_auth_info *pin_info)
 	return 1;
 }
 
+/* Isolated experiment, disabled by default. C_Login still verifies the PIN;
+ * subsequent physical PIN queries from C_GetSessionInfo and C_GetTokenInfo
+ * are suppressed. Token flags then use cached public retry metadata.
+ * Returning UNKNOWN leaves session state governed by slot->login_user,
+ * without claiming that the physical card's status was read.
+ */
+static int
+pkcs15_chipdoc_session_state(struct sc_pkcs15_card *p15card,
+		struct sc_pkcs15_auth_info *pin_info, int login_user)
+{
+	static const unsigned char generic_aid[] = {
+		0xE8, 0x28, 0xBD, 0x08, 0x0F, 0xD2, 0x50,
+		0x47, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63
+	};
+	const char *mode = getenv("OPENSC_JCOP3_SESSION_STATE");
+
+	return mode && !strcmp(mode, "yes") && login_user == CKU_USER &&
+			p15card && p15card->card && p15card->app && pin_info &&
+			p15card->card->type == SC_CARD_TYPE_IASECC_AMOS &&
+			p15card->app->aid.len == sizeof(generic_aid) &&
+			!memcmp(p15card->app->aid.value, generic_aid, sizeof(generic_aid)) &&
+			pin_info->auth_type == SC_PKCS15_PIN_AUTH_TYPE_PIN &&
+			pin_info->auth_method == SC_AC_CHV && pin_info->attrs.pin.reference == 1 &&
+			!(pin_info->attrs.pin.flags & (SC_PKCS15_PIN_FLAG_LOCAL |
+			SC_PKCS15_PIN_FLAG_SO_PIN | SC_PKCS15_PIN_FLAG_UNBLOCKING_PIN)) &&
+			pin_info->path.type == SC_PATH_TYPE_FILE_ID && !pin_info->path.aid.len &&
+			pin_info->path.len == 2 && pin_info->path.value[0] == 0x3F && !pin_info->path.value[1];
+}
+
 int slot_get_logged_in_state(struct sc_pkcs11_slot *slot)
 {
 	int logged_in = SC_PIN_STATE_UNKNOWN;
+	int pin_rv;
 	struct pkcs15_fw_data *fw_data = NULL;
 	struct sc_pkcs15_card *p15card = NULL;
 	struct sc_pkcs15_object *pin_obj = NULL;
@@ -1359,8 +1424,21 @@ int slot_get_logged_in_state(struct sc_pkcs11_slot *slot)
 	pin_info = (struct sc_pkcs15_auth_info *)pin_obj->data;
 	if (!pin_info)
 		goto out;
-	sc_pkcs15_get_pin_info(p15card, pin_obj);
+	if (pkcs15_chipdoc_session_state(p15card, pin_info, slot->login_user)) {
+		sc_api_metadata_trace(SC_API_SESSION_LOGIN_STATE, 0, CKR_OK,
+				SC_PIN_STATE_UNKNOWN, (CK_ULONG)slot->login_user);
+		return SC_PIN_STATE_UNKNOWN;
+	}
+	pin_rv = sc_pkcs15_get_pin_info(p15card, pin_obj);
+	sc_api_metadata_trace(SC_API_PIN_STATUS, 0, (CK_RV)pin_rv,
+			pin_info->logged_in, (CK_ULONG)slot->login_user);
 	logged_in = pin_info->logged_in & ~SC_PIN_STATE_NEEDS_CHANGE;
+	if (iasecc_chipdoc_configured(p15card->card) &&
+			(pin_rv < 0 || logged_in != SC_PIN_STATE_LOGGED_IN)) {
+		logged_in = SC_PIN_STATE_LOGGED_OUT;
+		slot->login_user = -1;
+		pop_all_login_states(slot);
+	}
 out:
 	return logged_in;
 }
@@ -1765,6 +1843,8 @@ pkcs15_login(struct sc_pkcs11_slot *slot, CK_USER_TYPE userType,
 	p11card = slot->p11card;
 
 	fw_data = (struct pkcs15_fw_data *) p11card->fws_data[slot->fw_data_idx];
+	if (iasecc_chipdoc_configured(p11card->card) && userType != CKU_USER)
+		return CKR_USER_TYPE_INVALID;
 	if (!fw_data)
 		return sc_to_cryptoki_error(SC_ERROR_INTERNAL, "C_Login");
 	p15card = fw_data->p15_card;
@@ -1963,6 +2043,12 @@ pkcs15_logout(struct sc_pkcs11_slot *slot)
 	fw_data->user_puk_len = 0;
 
 	sc_pkcs15_pincache_clear(fw_data->p15_card);
+	/* This profile owns a managed reservation; logout must close that
+	 * reservation even when ordinary PKCS15 uses software-only logout. */
+	if (iasecc_chipdoc_configured(fw_data->p15_card->card)) {
+		int closed = sc_logout(fw_data->p15_card->card);
+		return sc_to_cryptoki_error(closed, "C_Logout");
+	}
 
 #if defined(SW_PIN_LOGOUT_ONLY) && SW_PIN_LOGOUT_ONLY == 1
 	sc_log(context, "Clearing PIN state without calling sc_logout()");
@@ -4319,6 +4405,11 @@ pkcs15_prkey_sign(struct sc_pkcs11_session *session, void *obj,
 	if (prkey == NULL)
 		return CKR_KEY_FUNCTION_NOT_PERMITTED;
 
+	/* Public key metadata only, after resolving alternative key objects. */
+	sc_api_metadata_trace(SC_API_SIGN_KEY, session->handle, CKR_OK,
+			(CK_ULONG)prkey->prv_info->key_reference,
+			(CK_ULONG)prkey->prv_info->modulus_length);
+
 	switch (pMechanism->mechanism) {
 	case CKM_RSA_PKCS:
 		flags = SC_ALGORITHM_RSA_PAD_PKCS1_TYPE_01 | SC_ALGORITHM_RSA_HASH_NONE;
@@ -6511,6 +6602,8 @@ register_mechanisms(struct sc_pkcs11_card *p11card)
 	sc_pkcs11_register_generic_mechanisms(p11card);
 
 	mech_info.flags = CKF_HW | CKF_SIGN | CKF_DECRYPT;
+	if (iasecc_chipdoc_configured(card))
+		mech_info.flags &= ~CKF_DECRYPT;
 #ifdef ENABLE_OPENSSL
 	/* That practise definitely conflicts with CKF_HW -- andre 2010-11-28 */
 	mech_info.flags |= CKF_VERIFY;
