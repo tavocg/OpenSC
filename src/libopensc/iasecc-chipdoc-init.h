@@ -85,11 +85,13 @@ iasecc_chipdoc_initialize(struct sc_card *card, const struct sc_card_operations 
 	if (rv)
 		return rv;
 	struct iasecc_private_data *prv = calloc(1, sizeof(*prv));
-	struct sc_algorithm_info *algorithm = calloc(1, sizeof(*algorithm));
-	if (!prv || !algorithm) {
-		free(prv);
-		free(algorithm);
+	if (!prv)
 		return SC_ERROR_OUT_OF_MEMORY;
+	rv = _sc_card_add_rsa_alg(card, p->signing_bits,
+			SC_ALGORITHM_RSA_PAD_PKCS1_TYPE_01 | SC_ALGORITHM_RSA_HASH_SHA256, 0);
+	if (rv) {
+		free(prv);
+		return rv;
 	}
 	struct sc_card_operations ops = {0};
 	ops.select_file = metadata->select_file;
@@ -103,13 +105,8 @@ iasecc_chipdoc_initialize(struct sc_card *card, const struct sc_card_operations 
 	ops.card_reader_lock_obtained = lock_hook;
 	ops.pin_cmd = chipdoc_unbound_pin;
 	ops.logout = chipdoc_unbound_logout;
-	algorithm->algorithm = SC_ALGORITHM_RSA;
-	algorithm->key_length = 2048;
-	algorithm->flags = SC_ALGORITHM_RSA_PAD_PKCS1_TYPE_01 | SC_ALGORITHM_RSA_HASH_SHA256;
 	prv->chipdoc_enabled = 1;
 	card->drv_data = prv;
-	card->algorithms = algorithm;
-	card->algorithm_count = 1;
 	card->caps = candidate.caps;
 	card->max_send_size = p->min_send;
 	card->max_recv_size = p->min_receive;
