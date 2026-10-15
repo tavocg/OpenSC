@@ -26,6 +26,7 @@
 #include "libopensc/types.h"
 #include "libopensc/iasecc-sdo.h"
 #include "libopensc/iasecc-chipdoc.h"
+#include "libopensc/cards.h"
 
 #define ISO7812_PAN_SN_TAG	0x5A
 
@@ -178,6 +179,22 @@ iasecc_chipdoc_configured(const struct sc_card *card)
 		card->drv_data && ((const struct iasecc_private_data *)card->drv_data)->chipdoc_enabled;
 }
 struct sc_pkcs15_card;
+struct sc_pkcs15_object;
+int iasecc_chipdoc_pkcs15_validate(struct sc_pkcs15_card *p15, struct sc_pkcs15_object **key);
 int iasecc_chipdoc_pkcs15_activate(struct sc_pkcs15_card *p15);
+
+/* The existing Amos ATR match alone is insufficient: only the Generic PKI
+ * application used by the JCOP3 patch needs these PKCS#15/session defaults. */
+static inline int
+iasecc_chipdoc_jcop3(const struct sc_card *card, const struct sc_aid *aid)
+{
+	static const unsigned char generic_aid[] = {
+		0xE8, 0x28, 0xBD, 0x08, 0x0F, 0xD2, 0x50,
+		0x47, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63
+	};
+	return card && card->driver && card->driver->short_name &&
+			!strcmp(card->driver->short_name, "iasecc") && card->type == SC_CARD_TYPE_IASECC_AMOS &&
+			aid && aid->len == sizeof(generic_aid) && !memcmp(aid->value, generic_aid, sizeof(generic_aid));
+}
 
 #endif

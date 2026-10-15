@@ -19,6 +19,10 @@ struct iasecc_chipdoc_channel_report {
 int iasecc_chipdoc_channel_supported(struct sc_card *card);
 int iasecc_chipdoc_channel_pin_status(struct sc_card *card, int *logged_in);
 
+/* Public discovery for the shared ATR, including native key/PIN metadata.
+ * Does not open a channel, query/verify a PIN or install operation routing. */
+int iasecc_chipdoc_detect(struct sc_card *card, struct sc_card_driver *driver);
+
 /* Explicit internal controller; not wired to public PKCS15/PKCS11 yet.
  * Adds exactly one sc_lock (nested callers retain theirs), resets once,
  * bootstraps the channel and selects MF short. Success keeps our lock until

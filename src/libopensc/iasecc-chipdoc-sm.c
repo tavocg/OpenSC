@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later
  * Bounded anonymous channel transport for the measured ChipDoc profile.
- * Private typed PIN/signature operations; no automatic public driver binding
- * or generic SM wrapper.
+ * Public profile discovery and private typed PIN/signature operations;
+ * no generic SM wrapper.
  */
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -21,6 +21,7 @@
 #include "jcop4-channel-controls.h"
 #include "jcop4-dh-control.h"
 #include "sc-ossl-compat.h"
+#include <openssl/err.h>
 
 /* Borrowed context identity: sc_context owns providers/libctx and must outlive
  * its card/channel. Never load providers or override its default properties. */
@@ -106,6 +107,124 @@ iasecc_chipdoc_channel_supported(struct sc_card *card)
 		return SC_ERROR_NOT_SUPPORTED;
 	return chipdoc_platform_supported(card);
 }
+
+static int
+chipdoc_discovery_read(struct sc_card *card, unsigned int offset, unsigned char *out,
+		size_t size, unsigned long *flags)
+{
+	return sc_get_iso7816_driver()->ops->read_binary(card, offset, out, size > 256 ? 256 : size, flags);
+}
+
+int
+iasecc_chipdoc_detect(struct sc_card *card, struct sc_card_driver *driver)
+{
+	const struct iasecc_chipdoc_profile *p = iasecc_chipdoc_profile(IASECC_CHIPDOC_CR_RSA2048);
+	struct iasecc_private_data data = {0};
+	struct sc_card candidate;
+	struct sc_card_operations metadata_ops;
+	struct sc_pkcs15_card *p15 = NULL;
+	struct sc_pkcs15_object *key;
+	struct sc_apdu apdu;
+	unsigned char control[256], initial[137], peer[133];
+	int matched = 0, rv, marked;
+
+	if (!card || !card->ctx || !card->reader || !card->reader->ops ||
+			!card->reader->ops->lock || !card->reader->ops->unlock || !card->reader->ops->reset ||
+			card->atr.len != p->atr_len || memcmp(card->atr.value, p->atr, p->atr_len) ||
+			(card->max_send_size && card->max_send_size < p->min_send) ||
+			(card->max_recv_size && card->max_recv_size < p->min_receive))
+		return 0;
+	/* Check availability without changing the real card's algorithms, limits,
+	 * capabilities, driver or private data on a failed match. */
+	candidate = *card;
+	candidate.driver = driver;
+	candidate.drv_data = &data;
+	candidate.caps = SC_CARD_CAP_APDU_EXT | SC_CARD_CAP_ISO7816_PIN_INFO;
+	candidate.max_send_size = p->min_send;
+	candidate.max_recv_size = p->min_receive;
+	if (iasecc_chipdoc_channel_supported(&candidate) != SC_SUCCESS || sc_lock(card) != SC_SUCCESS)
+		return 0;
+
+	/* ATR and AID are shared with other personalizations. Require the observed
+	 * D004 control structure, size, curve selector and valid public point too.
+	 * No reset, authentication, PIN query or secure-channel setup is sent. */
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, 0xA4, 4, 0x0C);
+	apdu.cla = 0;
+	apdu.data = p->aid;
+	apdu.datalen = apdu.lc = p->aid_len;
+	apdu.resp = control;
+	apdu.resplen = sizeof(control);
+	apdu.flags = SC_APDU_FLAGS_NO_RETRY_WL | SC_APDU_FLAGS_NO_GET_RESP | SC_APDU_FLAGS_NO_SM;
+	rv = sc_transmit_apdu(card, &apdu);
+	if (rv != SC_SUCCESS || apdu.sw1 != 0x90 || apdu.sw2 != 0 || apdu.resplen != 0)
+		goto out;
+
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0xA4, 2, 0);
+	apdu.cla = 0;
+	apdu.data = (const unsigned char *)"\xD0\x04";
+	apdu.datalen = apdu.lc = 2;
+	apdu.resp = control;
+	apdu.le = apdu.resplen = sizeof(control);
+	apdu.flags = SC_APDU_FLAGS_NO_RETRY_WL | SC_APDU_FLAGS_NO_GET_RESP | SC_APDU_FLAGS_NO_SM;
+	rv = sc_transmit_apdu(card, &apdu);
+	if (rv != SC_SUCCESS || apdu.sw1 != 0x90 || apdu.sw2 != 0 ||
+			apdu.resplen > sizeof(control) || !d004_control_matches_observation(control, apdu.resplen))
+		goto out;
+
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_2_SHORT, 0xB0, 0, 0);
+	apdu.cla = 0;
+	apdu.resp = initial;
+	apdu.le = apdu.resplen = sizeof(initial);
+	apdu.flags = SC_APDU_FLAGS_NO_RETRY_WL | SC_APDU_FLAGS_NO_GET_RESP | SC_APDU_FLAGS_NO_SM;
+	rv = sc_transmit_apdu(card, &apdu);
+	if (rv != SC_SUCCESS || apdu.sw1 != 0x90 || apdu.sw2 != 0 ||
+			apdu.resplen != sizeof(initial) || initial[2] != p->curve_selector)
+		goto out;
+	peer[0] = 4;
+	memcpy(peer + 1, initial + 5, sizeof(peer) - 1);
+	/* A failed public-point probe must not leave OpenSSL errors for the next
+	 * driver, or discard errors which were already present on entry. */
+	marked = ERR_set_mark();
+	rv = jcop4_p521_public_valid(peer, sizeof(peer));
+	if (marked)
+		ERR_pop_to_mark();
+	else
+		ERR_clear_error();
+	if (!rv)
+		goto out;
+
+	/* Even D004 is not sufficient to claim a shared-ATR card. Bind public
+	 * native directories on an isolated view and validate the exact key/PIN
+	 * association before selecting this driver. The temporary objects,
+	 * caches and routing never become part of the real sc_card. */
+	metadata_ops = *sc_get_iso7816_driver()->ops;
+	metadata_ops.read_binary = chipdoc_discovery_read;
+	candidate.ops = &metadata_ops;
+	candidate.type = SC_CARD_TYPE_IASECC_CHIPDOC;
+	candidate.cla = 0;
+	candidate.lock_count = card->lock_count; /* Borrow the outer reservation. */
+	candidate.app_count = -1;
+	memset(candidate.app, 0, sizeof(candidate.app));
+	data.chipdoc_enabled = 1;
+	p15 = sc_pkcs15_card_new();
+	if (!p15)
+		goto out;
+	p15->card = &candidate;
+	if (sc_pkcs15_bind_internal(p15, NULL) == SC_SUCCESS)
+		matched = iasecc_chipdoc_pkcs15_validate(p15, &key) == SC_SUCCESS;
+	sc_pkcs15_unbind(p15);
+	sc_free_apps(&candidate);
+out:
+	sc_mem_clear(control, sizeof(control));
+	sc_mem_clear(initial, sizeof(initial));
+	sc_mem_clear(peer, sizeof(peer));
+	/* The next driver/bind selects its own application. Never reset another
+	 * application's authentication state just to undo a discovery SELECT. */
+	if (sc_unlock(card) != SC_SUCCESS)
+		matched = 0;
+	return matched;
+}
+
 int
 iasecc_chipdoc_channel_pin_status(struct sc_card *card, int *logged_in)
 {
@@ -1101,6 +1220,14 @@ iasecc_chipdoc_channel_compute_signature(struct sc_card *card,
 }
 
 #else
+
+int
+iasecc_chipdoc_detect(struct sc_card *card, struct sc_card_driver *driver)
+{
+	(void)card;
+	(void)driver;
+	return 0;
+}
 /* Unsupported crypto builds preserve all legacy drivers. No secret context,
  * APDU, session transition or algorithm advertisement in this branch. */
 int

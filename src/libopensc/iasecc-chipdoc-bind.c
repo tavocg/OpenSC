@@ -8,12 +8,17 @@
 #include "internal.h"
 #include "pkcs15.h"
 
-/* Called only for the explicitly initialized candidate after native bind.
- * Enumerate public key/PIN metadata before installing restricted routing. */
+/* Public metadata validation shared by discovery and post-bind activation.
+ * Discovery never installs routing or retains the temporary objects. */
 int
-iasecc_chipdoc_pkcs15_activate(struct sc_pkcs15_card *p15)
+iasecc_chipdoc_pkcs15_validate(struct sc_pkcs15_card *p15, struct sc_pkcs15_object **key_out)
 {
 	struct sc_pkcs15_object *objects[32], *key = NULL;
+	struct iasecc_chipdoc_pkcs15_operation operation;
+	int rv;
+	if (!key_out)
+		return SC_ERROR_INVALID_ARGUMENTS;
+	*key_out = NULL;
 	if (!p15 || !iasecc_chipdoc_configured(p15->card))
 		return SC_ERROR_NOT_SUPPORTED;
 	if (p15->flags & SC_PKCS15_CARD_FLAG_EMULATED)
@@ -38,5 +43,21 @@ iasecc_chipdoc_pkcs15_activate(struct sc_pkcs15_card *p15)
 		return count;
 	if (!count || count >= 32)
 		return SC_ERROR_NOT_SUPPORTED;
-	return iasecc_chipdoc_routing_install(p15, key);
+	rv = iasecc_chipdoc_pkcs15_operation(p15, key, &operation);
+	if (!rv)
+		*key_out = key;
+	return rv;
+}
+
+int
+iasecc_chipdoc_pkcs15_activate(struct sc_pkcs15_card *p15)
+{
+#ifdef ENABLE_OPENSSL
+	struct sc_pkcs15_object *key;
+	int rv = iasecc_chipdoc_pkcs15_validate(p15, &key);
+	return rv ? rv : iasecc_chipdoc_routing_install(p15, key);
+#else
+	(void)p15;
+	return SC_ERROR_NOT_SUPPORTED;
+#endif
 }

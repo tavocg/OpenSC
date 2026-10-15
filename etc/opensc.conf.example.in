@@ -211,14 +211,15 @@ app default {
 		#can = 123456;
 	}
 
-	# Experimental Costa Rican ChipDoc RSA2048 profile, disabled by default.
+	# Costa Rican ChipDoc RSA2048 profile, detected automatically by its ATR,
+	# application, public D004 structure/curve and native key/PIN metadata.
 	# Requires debug=0, OpenSSL 3, T=1 and declared reader limits >=139/291.
 	# Native PKCS#15 binding disables file/PIN caches for this profile.
 	# Shared ATR/AID are a candidate, not an identity check. RSA3072 untested.
-	# Keep iasecc as the selected card driver when explicitly enabling this.
-	# card_drivers = iasecc;
 	card_driver iasecc {
-		# chipdoc_profile = cr-rsa2048;
+		# auto: public discovery (default); none: disable discovery.
+		# cr-rsa2048: retain the explicit profile selection without discovery.
+		# chipdoc_profile = auto;
 	}
 
 	card_driver eoi {

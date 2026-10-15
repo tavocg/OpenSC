@@ -147,14 +147,7 @@ _iasecc_cpx_fixup_prkdf(struct sc_pkcs15_card *p15card)
 static int
 _iasecc_is_chipdoc(struct sc_pkcs15_card *p15card)
 {
-	static const unsigned char generic_aid[] = {
-		0xE8, 0x28, 0xBD, 0x08, 0x0F, 0xD2, 0x50,
-		0x47, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63
-	};
-
-	return p15card->card->type == SC_CARD_TYPE_IASECC_AMOS && p15card->app &&
-			p15card->app->aid.len == sizeof(generic_aid) &&
-			!memcmp(p15card->app->aid.value, generic_aid, sizeof(generic_aid));
+	return p15card->app && iasecc_chipdoc_jcop3(p15card->card, &p15card->app->aid);
 }
 
 /* ChipDoc's AODF describes global CHV 1 with path 0001, but that EF is

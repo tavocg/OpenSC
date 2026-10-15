@@ -70,6 +70,7 @@ struct pkcs15_fw_data {
 	struct pkcs15_any_object *	objects[MAX_OBJECTS];
 	unsigned int			num_objects;
 	unsigned int			locked;
+	int lock_login;
 	unsigned char *user_puk;
 	unsigned int user_puk_len;
 };
@@ -307,6 +308,14 @@ pkcs15_bind(struct sc_pkcs11_card *p11card, struct sc_app_info *app_info)
 	if (rc != SC_SUCCESS) {
 		sc_log(context, "sc_pkcs15_bind failed: %d", rc);
 		return sc_to_cryptoki_error(rc, NULL);
+	}
+	fw_data->lock_login = sc_pkcs11_conf.lock_login;
+	if (fw_data->p15_card->app && iasecc_chipdoc_jcop3(p11card->card, &fw_data->p15_card->app->aid)) {
+		scconf_block *block = sc_get_conf_block(p11card->card->ctx, "pkcs11", NULL, 1);
+		/* JCOP3 needs its reservation to survive between API calls. Keep the
+		 * default per binding; changing the global setting affects other cards.
+		 * An explicit atomic/lock_login configuration keeps its old meaning. */
+		fw_data->lock_login = scconf_get_bool(block, "lock_login", 1);
 	}
 
 	/* Mechanisms are registered globally per card. Checking
@@ -1868,7 +1877,7 @@ pkcs15_login(struct sc_pkcs11_slot *slot, CK_USER_TYPE userType,
 		 * accept any PIN, and lock the card if required */
 		if (rc == SC_ERROR_OBJECT_NOT_FOUND)   {
 			rc = 0;
-			if (sc_pkcs11_conf.lock_login)
+			if (fw_data->lock_login)
 				rc = lock_card(fw_data);
 
 			if (sc_pkcs11_conf.pin_unblock_style == SC_PKCS11_PIN_UNBLOCK_SO_LOGGED_INITPIN)   {
@@ -1913,7 +1922,7 @@ pkcs15_login(struct sc_pkcs11_slot *slot, CK_USER_TYPE userType,
 		 */
 		/* For a while, used only to unblock User PIN. */
 		rc = 0;
-		if (sc_pkcs11_conf.lock_login)
+		if (fw_data->lock_login)
 			rc = lock_card(fw_data);
 		sc_log(context, "context specific login returns %d", rc);
 		return sc_to_cryptoki_error(rc, "C_Login");
@@ -1939,7 +1948,7 @@ pkcs15_login(struct sc_pkcs11_slot *slot, CK_USER_TYPE userType,
 	 * before the crypto operation that requires the assertion
 	 */
 	if (userType != CKU_CONTEXT_SPECIFIC) {
-		if (sc_pkcs11_conf.lock_login && (rc = lock_card(fw_data)) < 0)   {
+		if (fw_data->lock_login && (rc = lock_card(fw_data)) < 0)   {
 			return sc_to_cryptoki_error(rc, "C_Login");
 		}
 	}
@@ -2062,7 +2071,7 @@ pkcs15_logout(struct sc_pkcs11_slot *slot)
 	if (rc != SC_SUCCESS)
 		ret = sc_to_cryptoki_error(rc, "C_Logout");
 
-	if (sc_pkcs11_conf.lock_login) {
+	if (fw_data->lock_login) {
 		rc = unlock_card(fw_data);
 		if (rc != SC_SUCCESS)
 			ret = sc_to_cryptoki_error(rc, "C_Logout");

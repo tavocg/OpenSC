@@ -360,9 +360,9 @@ iasecc_match_card(struct sc_card *card)
 {
 	struct sc_context *ctx = card->ctx;
 	int i;
-	if (iasecc_chipdoc_opted_in(card)) {
+	if (iasecc_chipdoc_match(card, &iasecc_drv)) {
 		card->type = SC_CARD_TYPE_IASECC_CHIPDOC;
-		return 1; /* ATR/config candidate only; native metadata checked after bind. */
+		return 1; /* Native key/PIN metadata is still checked after bind. */
 	}
 
 	i = _sc_match_atr(card, iasecc_known_atrs, &card->type);

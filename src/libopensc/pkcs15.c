@@ -1328,7 +1328,7 @@ sc_pkcs15_bind(struct sc_card *card, struct sc_aid *aid,
 	struct sc_pkcs15_card *p15card = NULL;
 	struct sc_context *ctx;
 	scconf_block *conf_block = NULL;
-	int r, emu_first, enable_emu;
+	int r, emu_first, enable_emu, chipdoc_jcop3 = 0;
 	const char *use_file_cache;
 	const char *pin_protected_certificate, *private_certificate;
 
@@ -1399,7 +1399,7 @@ sc_pkcs15_bind(struct sc_card *card, struct sc_aid *aid,
 		LOG_FUNC_RETURN(ctx, r);
 	}
 
-	/* This explicit candidate uses native directories only. A failed bind or
+	/* This measured profile uses native directories only. A failed bind or
 	 * post-bind validation must not recover through a synthetic IAS profile. */
 	if (iasecc_chipdoc_configured(card)) {
 		p15card->opts.use_file_cache = SC_PKCS15_OPTS_CACHE_NO_FILES;
@@ -1408,10 +1408,26 @@ sc_pkcs15_bind(struct sc_card *card, struct sc_aid *aid,
 		if (r < 0) goto error;
 		goto done;
 	}
+	/* Enumerate only the existing Amos candidates, under the same lock that
+	 * native bind uses. Other IAS/ECC applications keep their original order
+	 * and cache policy. Honour explicit framework options for JCOP3 too. */
+	if (card->type == SC_CARD_TYPE_IASECC_AMOS && card->driver && card->driver->short_name &&
+			!strcmp(card->driver->short_name, "iasecc")) {
+		const struct sc_app_info *app;
+		if (card->app_count < 0)
+			sc_enum_apps(card);
+		app = sc_find_app(card, aid);
+		chipdoc_jcop3 = app && iasecc_chipdoc_jcop3(card, &app->aid);
+		if (chipdoc_jcop3) {
+			p15card->opts.use_pin_cache = scconf_get_bool(conf_block, "use_pin_caching", 0);
+			if (!scconf_find_list(conf_block, "use_file_caching"))
+				p15card->opts.use_file_cache = SC_PKCS15_OPTS_CACHE_NO_FILES;
+		}
+	}
 	enable_emu = scconf_get_bool(conf_block, "enable_pkcs15_emulation", 1);
 	if (enable_emu) {
 		sc_log(ctx, "PKCS#15 emulation enabled");
-		emu_first = scconf_get_bool(conf_block, "try_emulation_first", 0);
+		emu_first = scconf_get_bool(conf_block, "try_emulation_first", chipdoc_jcop3);
 		if (emu_first || sc_pkcs15_is_emulation_only(card)) {
 			r = sc_pkcs15_bind_synthetic(p15card, aid);
 			if (r == SC_SUCCESS)

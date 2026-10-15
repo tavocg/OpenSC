@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later
- * Experimental opt-in initialization. Limits are ceilings for the measured
+ * Initialization of the measured profile. Limits are ceilings for the measured
  * operation, not advertised physical maxima or discovery/authentication. */
 #ifndef OPENSC_IASECC_CHIPDOC_INIT_H
 #define OPENSC_IASECC_CHIPDOC_INIT_H
@@ -8,13 +8,12 @@
 #include "scconf/scconf.h"
 #include <stdlib.h>
 
-static inline int
-iasecc_chipdoc_opted_in(const struct sc_card *card)
+static inline const char *
+iasecc_chipdoc_profile_option(const struct sc_card *card)
 {
 	const char *value = NULL;
-	const struct iasecc_chipdoc_profile *p = iasecc_chipdoc_profile(IASECC_CHIPDOC_CR_RSA2048);
-	if (!card || !card->ctx || !card->ctx->conf || card->atr.len != p->atr_len || memcmp(card->atr.value, p->atr, p->atr_len))
-		return 0;
+	if (!card || !card->ctx || !card->ctx->conf)
+		return NULL;
 	for (int i = 0; card->ctx->conf_blocks[i]; i++) {
 		scconf_block **blocks = scconf_find_blocks(card->ctx->conf, card->ctx->conf_blocks[i], "card_driver", "iasecc");
 		if (!blocks)
@@ -23,7 +22,24 @@ iasecc_chipdoc_opted_in(const struct sc_card *card)
 			value = scconf_get_str(blocks[j], "chipdoc_profile", value);
 		free(blocks);
 	}
-	return value && !strcmp(value, "cr-rsa2048");
+	return value;
+}
+
+static inline int
+iasecc_chipdoc_match(struct sc_card *card, struct sc_card_driver *driver)
+{
+	const struct iasecc_chipdoc_profile *p = iasecc_chipdoc_profile(IASECC_CHIPDOC_CR_RSA2048);
+	const char *value;
+	if (!card || card->atr.len != p->atr_len || memcmp(card->atr.value, p->atr, p->atr_len))
+		return 0;
+	value = iasecc_chipdoc_profile_option(card);
+	/* Preserve the existing explicit profile. Other explicit values disable
+	 * automatic probing, so a configuration can retain the old dispatch. */
+	if (value && !strcmp(value, "cr-rsa2048"))
+		return 1;
+	if (value && strcmp(value, "auto"))
+		return 0;
+	return iasecc_chipdoc_detect(card, driver);
 }
 static inline int
 chipdoc_unbound_pin(struct sc_card *card, struct sc_pin_cmd_data *data)
@@ -67,7 +83,9 @@ iasecc_chipdoc_initialize(struct sc_card *card, const struct sc_card_operations 
 	const struct iasecc_chipdoc_profile *p = iasecc_chipdoc_profile(IASECC_CHIPDOC_CR_RSA2048);
 	struct iasecc_private_data candidate_data = {0};
 	struct sc_card candidate;
-	if (!iasecc_chipdoc_opted_in(card) || !card->ops || !card->driver || card->ops == card->driver->ops ||
+	if (!card || card->type != SC_CARD_TYPE_IASECC_CHIPDOC ||
+			card->atr.len != p->atr_len || memcmp(card->atr.value, p->atr, p->atr_len) ||
+			!card->ops || !card->driver || card->ops == card->driver->ops ||
 			card->drv_data || card->algorithm_count || card->algorithms || !metadata || !metadata->select_file ||
 			!metadata->read_binary || !finish || !lock_hook)
 		return SC_ERROR_NOT_SUPPORTED;

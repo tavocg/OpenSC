@@ -56,11 +56,12 @@ compression_LDADD = $(LDADD) $(OPTIONAL_ZLIB_LIBS)
 endif
 
 if ENABLE_OPENSSL
-noinst_PROGRAMS += sm
-TESTS += sm
+noinst_PROGRAMS += sm iasecc-detection
+TESTS += sm iasecc-detection
 
 sm_SOURCES = sm.c
 sm_LDADD = $(top_builddir)/src/sm/libsm.la $(LDADD)
+iasecc_detection_SOURCES = iasecc-detection.c
 endif
 
 
