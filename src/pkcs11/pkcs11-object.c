@@ -298,7 +298,6 @@ out:
 		sc_log(context, "C_GetAttributeValue(hSession=0x%lx, hObject=0x%lx) = 0x%lx",
                         hSession, hObject, rv);
 
-	sc_api_metadata_trace(SC_API_GET_ATTRIBUTE, hSession, rv, hObject, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -454,7 +453,6 @@ C_FindObjectsInit(CK_SESSION_HANDLE hSession,	/* the session's handle */
 	sc_log(context, "%d matching objects\n", operation->num_handles);
 
 out:
-	sc_api_metadata_trace(SC_API_FIND_INIT, hSession, rv, 0, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -705,7 +703,6 @@ C_SignInit(CK_SESSION_HANDLE hSession,		/* the session's handle */
 
 out:
 	SC_LOG_RV("C_SignInit() = %s", rv);
-	sc_api_metadata_trace(SC_API_SIGN_INIT, hSession, rv, pMechanism->mechanism, hKey);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -754,7 +751,6 @@ C_Sign(CK_SESSION_HANDLE hSession,		/* the session's handle */
 
 out:
 	SC_LOG_RV("C_Sign() = %s", rv);
-	sc_api_metadata_trace(SC_API_SIGN, hSession, rv, pSignature != NULL, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -777,7 +773,6 @@ C_SignUpdate(CK_SESSION_HANDLE hSession,	/* the session's handle */
 		rv = sc_pkcs11_sign_update(session, pPart, ulPartLen);
 
 	SC_LOG_RV("C_SignUpdate() = %s", rv);
-	sc_api_metadata_trace(SC_API_SIGN_UPDATE, hSession, rv, 0, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -820,7 +815,6 @@ C_SignFinal(CK_SESSION_HANDLE hSession,		/* the session's handle */
 
 out:
 	SC_LOG_RV("C_SignFinal() = %s", rv);
-	sc_api_metadata_trace(SC_API_SIGN_FINAL, hSession, rv, pSignature != NULL, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }

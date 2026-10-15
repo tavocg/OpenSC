@@ -31,7 +31,6 @@
 #include "pkcs11.h"
 #include "pkcs11-opensc.h"
 #include "pkcs11-display.h"
-#include "libopensc/api-trace.h"
 
 #ifdef __cplusplus
 extern "C" {

@@ -119,7 +119,7 @@ chipdoc_route_pin(struct sc_card *card, struct sc_pin_cmd_data *data)
 			data->apdu || data->pin2.data || data->pin2.len)
 		return SC_ERROR_NOT_SUPPORTED;
 	if (data->cmd == SC_PIN_CMD_GET_INFO) {
-		if ((data->flags && data->flags != SC_PIN_CMD_STATUS_ONLY) || data->pin1.data || data->pin1.len)
+		if (data->flags || data->pin1.data || data->pin1.len)
 			return SC_ERROR_INVALID_ARGUMENTS;
 		rv = iasecc_chipdoc_channel_pin_status(card, &data->pin1.logged_in);
 		if (rv) {
@@ -330,11 +330,6 @@ chipdoc_route_finish(struct sc_card *card)
 static inline int
 iasecc_chipdoc_routing_install(struct sc_pkcs15_card *p15, const struct sc_pkcs15_object *key)
 {
-#if defined(IASECC_CHIPDOC_NO_CRYPTO)
-	(void)p15;
-	(void)key;
-	return SC_ERROR_NOT_SUPPORTED;
-#else
 	struct iasecc_chipdoc_pkcs15_operation op;
 	struct sc_card *card = p15 ? p15->card : NULL;
 	int rv = iasecc_chipdoc_channel_supported(card);
@@ -389,19 +384,6 @@ iasecc_chipdoc_routing_install(struct sc_pkcs15_card *p15, const struct sc_pkcs1
 	p15->opts.use_pin_cache = 0;
 	p15->ops.clear = chipdoc_route_clear;
 	*card->ops = b->filtered;
-	return SC_SUCCESS;
-#endif
-}
-static inline int
-iasecc_chipdoc_routing_last_report(struct sc_card *card, struct iasecc_chipdoc_routing_report *report)
-{
-	if (!report)
-		return SC_ERROR_INVALID_ARGUMENTS;
-	memset(report, 0, sizeof(*report));
-	struct iasecc_chipdoc_routing *b = chipdoc_route(card);
-	if (!b)
-		return SC_ERROR_NOT_ALLOWED;
-	*report = b->last;
 	return SC_SUCCESS;
 }
 #endif

@@ -132,18 +132,4 @@ iasecc_chipdoc_pkcs15_operation(const struct sc_pkcs15_card *p15,
 	operation->selects_application = info->path.aid.len != 0;
 	return SC_SUCCESS;
 }
-
-/* Explicit private opt-in, no I/O/algorithm announcement/driver binding.
- * All validation precedes mutation. A caller enabling this operation must
- * keep caching disabled through authentication/signing; no saved PIN is read
- * or cleared, and failed validation leaves every option/object unchanged. */
-static inline int
-iasecc_chipdoc_pkcs15_disable_pin_cache(struct sc_pkcs15_card *p15,
-		const struct sc_pkcs15_object *key, struct iasecc_chipdoc_pkcs15_operation *operation)
-{
-	int rv = iasecc_chipdoc_pkcs15_operation(p15, key, operation);
-	if (!rv)
-		p15->opts.use_pin_cache = 0;
-	return rv;
-}
 #endif

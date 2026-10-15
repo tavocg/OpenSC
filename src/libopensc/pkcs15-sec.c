@@ -31,7 +31,6 @@
 #endif
 
 #include "internal.h"
-#include "api-trace.h"
 #include "pkcs15.h"
 #include "pkcs11/pkcs11.h"
 
@@ -143,28 +142,22 @@ static int use_key(struct sc_pkcs15_card *p15card,
 	do {
 		if (path.len != 0 || path.aid.len != 0) {
 			r = select_key_file(p15card, obj, senv);
-			sc_api_metadata_trace(SC_API_KEY_SELECT, 0, (unsigned long)r, senv->operation, 0);
 			if (r < 0) {
 				sc_log(p15card->card->ctx,
 						"Unable to select private key file");
 			}
 		}
-		if (r == SC_SUCCESS) {
+		if (r == SC_SUCCESS)
 			r = sc_set_security_env(p15card->card, senv, 0);
-			sc_api_metadata_trace(SC_API_KEY_MSE, 0, (unsigned long)r, senv->operation, 0);
-		}
 
-		if (r == SC_SUCCESS) {
+		if (r == SC_SUCCESS)
 			r = card_command(p15card->card, in, inlen, out, outlen);
-			sc_api_metadata_trace(SC_API_KEY_COMPUTE, 0, (unsigned long)r, senv->operation, 0);
-		}
 
 		if (revalidated_cached_pin)
 			/* only re-validate once */
 			break;
 		if (r == SC_ERROR_SECURITY_STATUS_NOT_SATISFIED) {
 			r = sc_pkcs15_pincache_revalidate(p15card, obj);
-			sc_api_metadata_trace(SC_API_KEY_REVALIDATE, 0, (unsigned long)r, senv->operation, 0);
 			if (r < 0)
 				break;
 			revalidated_cached_pin = 1;

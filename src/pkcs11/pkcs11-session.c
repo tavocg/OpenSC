@@ -96,7 +96,6 @@ CK_RV C_OpenSession(CK_SLOT_ID slotID,	/* the slot's ID */
 
 out:
 	SC_LOG_RV("C_OpenSession() = %s", rv);
-	sc_api_metadata_trace(SC_API_OPEN_SESSION, rv == CKR_OK ? *phSession : 0, rv, slotID, flags);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -172,7 +171,6 @@ CK_RV C_CloseSession(CK_SESSION_HANDLE hSession)
 
 	rv = sc_pkcs11_close_session(hSession);
 
-	sc_api_metadata_trace(SC_API_CLOSE_SESSION, hSession, rv, 0, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -195,7 +193,6 @@ CK_RV C_CloseAllSessions(CK_SLOT_ID slotID)
 	rv = sc_pkcs11_close_all_sessions(slotID);
 
 out:
-	sc_api_metadata_trace(SC_API_CLOSE_ALL_SESSIONS, 0, rv, slotID, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -313,7 +310,6 @@ out:
 		sc_log(context, "C_GetSessionInfo(0x%lx) = %s", hSession, name);
 	else
 		sc_log(context, "C_GetSessionInfo(0x%lx) = 0x%lx", hSession, rv);
-	sc_api_metadata_trace(SC_API_SESSION_INFO, hSession, rv, rv == CKR_OK ? pInfo->state : CK_UNAVAILABLE_INFORMATION, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -420,7 +416,6 @@ CK_RV C_Login(CK_SESSION_HANDLE hSession,	/* the session's handle */
 	}
 
 out:
-	sc_api_metadata_trace(SC_API_LOGIN, hSession, rv, userType, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }
@@ -469,7 +464,6 @@ CK_RV C_Logout(CK_SESSION_HANDLE hSession)
 		rv = CKR_USER_NOT_LOGGED_IN;
 
 out:
-	sc_api_metadata_trace(SC_API_LOGOUT, hSession, rv, 0, 0);
 	sc_pkcs11_unlock();
 	return rv;
 }

@@ -150,17 +150,10 @@ jcop4_ca_prepare_ex(OSSL_LIB_CTX *libctx, const unsigned char *peer,
 	return result;
 }
 
-static inline int
-jcop4_ca_prepare_key(EVP_PKEY *local, const unsigned char *peer,
-		size_t size, struct jcop4_ca_pending *pending)
-{
-	return jcop4_ca_prepare_key_ex(NULL, local, peer, size, pending);
-}
-static inline int
-jcop4_ca_prepare(const unsigned char *peer, size_t size, struct jcop4_ca_pending *pending)
-{
-	return jcop4_ca_prepare_ex(NULL, peer, size, pending);
-}
+/* Canonical wire bytes shared by the transport validator so the accepted
+ * commands cannot drift from the constructed ones. */
+#define JCOP4_CA_MSE_BYTES {0x00, 0x22, 0x41, 0xA4, 0x0C, 0x80, 0x0A, 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x03, 0x02, 0x02}
+#define JCOP4_CA_GA_PREFIX_BYTES {0x10, 0x86, 0x00, 0x00, 0x8B, 0x7C, 0x81, 0x88, 0x80, 0x81, 0x85}
 
 /* Candidate wire bytes for the reviewed plain transport path, not a sender.
  * MSE/GA constructor Le=0 (absent), serializer copies CLA unchanged. Other
@@ -168,8 +161,7 @@ jcop4_ca_prepare(const unsigned char *peer, size_t size, struct jcop4_ca_pending
 static inline int
 jcop4_ca_build_mse(unsigned char *out, size_t capacity, size_t *written)
 {
-	static const unsigned char candidate[] = {0, 0x22, 0x41, 0xA4, 0x0C,
-			0x80, 0x0A, 4, 0, 0x7F, 0, 7, 2, 2, 3, 2, 2};
+	static const unsigned char candidate[] = JCOP4_CA_MSE_BYTES;
 	if (!written)
 		return 1;
 	*written = 0;
@@ -185,7 +177,7 @@ jcop4_ca_build_ga(const unsigned char *terminal_public, size_t size,
 		unsigned char *out, size_t capacity, size_t *written)
 {
 	/* Lc139, 7C length136, 80 length133, SEC1 prefix04; no trailing Le. */
-	static const unsigned char prefix[] = {0x10, 0x86, 0, 0, 0x8B, 0x7C, 0x81, 0x88, 0x80, 0x81, 0x85};
+	static const unsigned char prefix[] = JCOP4_CA_GA_PREFIX_BYTES;
 	unsigned char candidate[sizeof(prefix) + JCOP4_P521_POINT_SIZE];
 	if (!written)
 		return 1;

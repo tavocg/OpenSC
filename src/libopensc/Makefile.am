@@ -15,7 +15,7 @@ noinst_HEADERS = cards.h ctbcs.h internal.h muscle.h muscle-filesystem.h \
 	jpki.h sc-ossl-compat.h card-npa.h card-openpgp.h \
 	card-eoi.h card-dtrust.h card-srbeid.h ccid-types.h reader-tr03119.h \
 	card-cac-common.h card-cardos-common.h
-noinst_HEADERS += api-trace.h iasecc-chipdoc.h iasecc-chipdoc-sm.h \
+noinst_HEADERS += iasecc-chipdoc.h iasecc-chipdoc-sm.h \
 	iasecc-chipdoc-pkcs15.h iasecc-chipdoc-transaction.h \
 	iasecc-chipdoc-routing.h iasecc-chipdoc-init.h jcop4-dh-control.h \
 	jcop4-channel-kdf.h jcop4-channel-primitives.h jcop4-channel-agreement.h \

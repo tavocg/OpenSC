@@ -100,6 +100,155 @@ chipdoc_ready(struct sc_card *card, struct iasecc_private_data **data)
 	return SC_SUCCESS;
 }
 
+/* Common entry contract of the typed channel operations: caller-owned report,
+ * iasecc driver only and the pending-reset flag from the card's local state. */
+static int
+chipdoc_entry(struct sc_card *card, struct iasecc_chipdoc_channel_report *report)
+{
+	if (!report)
+		return SC_ERROR_INVALID_ARGUMENTS;
+	memset(report, 0, sizeof(*report));
+	if (!card || !card->driver || !card->driver->short_name || strcmp(card->driver->short_name, "iasecc"))
+		return SC_ERROR_NOT_SUPPORTED;
+	if (card->drv_data) {
+		struct iasecc_private_data *prv = card->drv_data;
+		report->reset_required = prv->chipdoc_transaction.active || prv->chipdoc_session.channel ||
+			prv->chipdoc_recovery_required;
+	}
+	return SC_SUCCESS;
+}
+
+/* Resolve the card's owned transaction. A failed readiness check is a dead
+ * session and invalidates it; a foreign live transaction is left alone. */
+static int
+chipdoc_channel_owned(struct sc_card *card, struct iasecc_private_data **prv_out)
+{
+	struct iasecc_private_data *prv = NULL;
+	int rv = chipdoc_ready(card, &prv);
+	if (rv) {
+		iasecc_chipdoc_invalidate_card(card);
+		return rv;
+	}
+	if (!iasecc_chipdoc_transaction_owns(card, prv))
+		return SC_ERROR_NOT_ALLOWED;
+	*prv_out = prv;
+	return SC_SUCCESS;
+}
+
+/* Verify the attached channel against its owner, phase and, when nonzero,
+ * its exact SSC counter. A local phase mismatch leaves the session for its
+ * owner; any identity or counter mismatch is a reset condition. */
+static int
+chipdoc_channel_live(struct sc_card *card, struct iasecc_private_data *prv,
+		enum iasecc_chipdoc_phase phase, unsigned int ssc_counter,
+		struct chipdoc_crypto **crypto_out, uint64_t *generation_out)
+{
+	unsigned char expected[16] = {0};
+	struct chipdoc_crypto *crypto;
+	if (prv->chipdoc_session.phase != phase || !prv->chipdoc_session.channel ||
+			prv->chipdoc_session.clear_channel != chipdoc_crypto_clear)
+		return SC_ERROR_SM_NOT_INITIALIZED;
+	crypto = prv->chipdoc_session.channel;
+	expected[15] = ssc_counter;
+	if (!chipdoc_provider_matches(card, &crypto->provider) || crypto->card != card ||
+			crypto->reader != card->reader || crypto->generation != prv->chipdoc_session.generation ||
+			crypto->sm.phase != JCOP4_SM_IDLE ||
+			(ssc_counter && CRYPTO_memcmp(crypto->sm.keys.ssc, expected, sizeof(expected))))
+		return SC_ERROR_CARD_RESET;
+	*crypto_out = crypto;
+	*generation_out = prv->chipdoc_session.generation;
+	return SC_SUCCESS;
+}
+
+/* Managed signing operations only. A phase mismatch is a local error; a
+ * stale provider/SSC/owner is an invalid session, never an invitation to retry. */
+static int
+chipdoc_signing_ready(struct sc_card *card, enum iasecc_chipdoc_phase phase,
+		unsigned int counter, struct iasecc_private_data **data)
+{
+	struct iasecc_private_data *prv = NULL;
+	struct chipdoc_crypto *crypto;
+	uint64_t generation;
+	int rv;
+	if (!card || !card->driver || !card->driver->short_name || strcmp(card->driver->short_name, "iasecc"))
+		return SC_ERROR_NOT_SUPPORTED;
+	rv = chipdoc_channel_owned(card, &prv);
+	if (rv)
+		return rv;
+	rv = chipdoc_channel_live(card, prv, phase, counter, &crypto, &generation);
+	if (rv == SC_ERROR_SM_NOT_INITIALIZED)
+		return rv;
+	if (rv) {
+		iasecc_chipdoc_invalidate_card(card);
+		return rv;
+	}
+	*data = prv;
+	return SC_SUCCESS;
+}
+
+/* Shared measured VERIFY transport: seal, one CASE4 command through the
+ * normal dispatcher, then the strict authenticated response policy. The empty
+ * query and the PIN verify differ only in phase/SSC, inner data and the status
+ * handling kept in their callers. Only an authenticated empty response is
+ * accepted: response bytes are a protocol violation, never data to return. */
+static int
+chipdoc_verify_exchange(struct sc_card *card, struct iasecc_private_data *prv,
+		struct chipdoc_crypto *crypto, uint64_t generation,
+		const unsigned char *data, size_t data_size, unsigned int *sw,
+		struct iasecc_chipdoc_channel_report *report)
+{
+	const unsigned char command[4] = {0, 0x20, 0, 1};
+	unsigned char header[4], body[29], response[258], plain[256];
+	size_t written = 0, size, plain_size = 0;
+	sc_apdu_t apdu;
+	int rv, result = SC_ERROR_SM_ENCRYPT_FAILED;
+	if (jcop4_sm_seal_policy_ex(crypto->provider.libctx, &crypto->sm, command, data, data_size,
+			0, 0, header, body, sizeof(body), &written, JCOP4_SM_LE_SHORT) ||
+			written != (data_size ? 29u : 10u))
+		goto out;
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x20, 0, 1);
+	apdu.cla = header[0];
+	apdu.data = body;
+	apdu.lc = apdu.datalen = written;
+	apdu.le = 256;
+	apdu.resp = response;
+	apdu.resplen = 256;
+	apdu.flags |= SC_APDU_FLAGS_NO_RETRY_WL | SC_APDU_FLAGS_NO_GET_RESP | SC_APDU_FLAGS_NO_SM;
+	report->commands = 1;
+	report->reset_required = 1;
+	rv = sc_transmit_apdu(card, &apdu);
+	report->transport = rv;
+	result = rv;
+	if (rv < 0)
+		goto out;
+	if (prv->chipdoc_session.channel != crypto || prv->chipdoc_session.generation != generation ||
+			!iasecc_chipdoc_transaction_owns(card, prv) || !chipdoc_provider_matches(card, &crypto->provider)) {
+		result = SC_ERROR_CARD_RESET;
+		goto out;
+	}
+	result = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+	if (apdu.resplen > 256)
+		goto out;
+	size = apdu.resplen;
+	response[size++] = apdu.sw1;
+	response[size++] = apdu.sw2;
+	result = SC_ERROR_SM_AUTHENTICATION_FAILED;
+	if (jcop4_sm_open_report_policy_ex(crypto->provider.libctx, &crypto->sm, response, size, plain,
+			sizeof(plain), &plain_size, sw, JCOP4_SM_OUTER_9000_OR_MATCHING_63CX))
+		goto out;
+	report->authenticated = 1;
+	report->sw = *sw;
+	result = plain_size ? SC_ERROR_INVALID_DATA : SC_SUCCESS;
+out:
+	sc_mem_clear(header, sizeof(header));
+	sc_mem_clear(body, sizeof(body));
+	sc_mem_clear(response, sizeof(response));
+	sc_mem_clear(plain, sizeof(plain));
+	if (result)
+		iasecc_chipdoc_invalidate_card(card);
+	return result;
+}
+
 int
 iasecc_chipdoc_channel_supported(struct sc_card *card)
 {
@@ -277,7 +426,8 @@ chipdoc_setup_exchange(void *opaque, const unsigned char *wire, size_t size,
 	struct iasecc_private_data *prv = NULL;
 	sc_apdu_t apdu;
 	int rv, cse;
-	static const unsigned char mse[] = {0, 0x22, 0x41, 0xA4, 12, 0x80, 10, 4, 0, 0x7F, 0, 7, 2, 2, 3, 2, 2};
+	static const unsigned char mse[] = JCOP4_CA_MSE_BYTES;
+	static const unsigned char ga_prefix[] = JCOP4_CA_GA_PREFIX_BYTES;
 	if (!received)
 		return SC_ERROR_INVALID_ARGUMENTS;
 	*received = 0;
@@ -291,8 +441,9 @@ chipdoc_setup_exchange(void *opaque, const unsigned char *wire, size_t size,
 			return SC_ERROR_NOT_ALLOWED;
 		cse = SC_APDU_CASE_3_SHORT;
 	} else if (x->step == 1) {
-		if (size != 144 || memcmp(wire, "\x10\x86\0\0\x8b\x7c\x81\x88\x80\x81\x85", 11) ||
-				!jcop4_p521_public_valid(wire + 11, 133))
+		if (size != sizeof(ga_prefix) + JCOP4_P521_POINT_SIZE ||
+				memcmp(wire, ga_prefix, sizeof(ga_prefix)) ||
+				!jcop4_p521_public_valid(wire + sizeof(ga_prefix), JCOP4_P521_POINT_SIZE))
 			return SC_ERROR_NOT_ALLOWED;
 		cse = SC_APDU_CASE_3_SHORT;
 	} else {
@@ -391,7 +542,6 @@ iasecc_chipdoc_channel_select_mf(struct sc_card *card,
 	unsigned int sw;
 	uint64_t generation;
 	sc_apdu_t apdu;
-	struct jcop4_sm_decode_report decoded;
 	int rv, result;
 	if (!report)
 		return SC_ERROR_INVALID_ARGUMENTS;
@@ -451,7 +601,7 @@ iasecc_chipdoc_channel_select_mf(struct sc_card *card,
 	response[size++] = apdu.sw1;
 	response[size++] = apdu.sw2;
 	result = SC_ERROR_SM_AUTHENTICATION_FAILED;
-	if (jcop4_sm_open_report_policy_ex(crypto->provider.libctx, &crypto->sm, response, size, plain, sizeof(plain), &plain_size, &sw, JCOP4_SM_OUTER_9000, &decoded))
+	if (jcop4_sm_open_report_policy_ex(crypto->provider.libctx, &crypto->sm, response, size, plain, sizeof(plain), &plain_size, &sw, JCOP4_SM_OUTER_9000))
 		goto out;
 	report->authenticated = 1;
 	report->sw = sw;
@@ -740,101 +890,43 @@ iasecc_chipdoc_channel_query_pin(struct sc_card *card, unsigned int reference,
 {
 	struct iasecc_private_data *prv = NULL;
 	struct chipdoc_crypto *crypto;
-	unsigned char header[4], body[10], response[258], plain[256];
-	const unsigned char query[4] = {0, 0x20, 0, 1};
-	size_t written = 0, size, plain_size;
 	unsigned int sw;
 	uint64_t generation;
-	struct sc_apdu apdu;
-	struct jcop4_sm_decode_report decoded;
-	int rv, result = SC_ERROR_SM_ENCRYPT_FAILED;
+	int rv;
 	if (tries_left)
 		*tries_left = -1;
-	if (!report)
-		return SC_ERROR_INVALID_ARGUMENTS;
-	memset(report, 0, sizeof(*report));
-	if (!card || !card->driver || !card->driver->short_name || strcmp(card->driver->short_name, "iasecc"))
-		return SC_ERROR_NOT_SUPPORTED;
-	if (card->drv_data)
-		report->reset_required = (((struct iasecc_private_data *)card->drv_data)->chipdoc_session.channel != NULL ||
-					  ((struct iasecc_private_data *)card->drv_data)->chipdoc_transaction.active ||
-					  ((struct iasecc_private_data *)card->drv_data)->chipdoc_recovery_required);
+	rv = chipdoc_entry(card, report);
+	if (rv)
+		return rv;
 	if (!tries_left || reference != 1)
 		return SC_ERROR_INVALID_ARGUMENTS;
-	rv = chipdoc_ready(card, &prv);
-	if (rv) {
-		iasecc_chipdoc_invalidate_card(card);
+	rv = chipdoc_channel_owned(card, &prv);
+	if (rv)
 		return rv;
-	}
-	if (!iasecc_chipdoc_transaction_owns(card, prv))
-		return SC_ERROR_NOT_ALLOWED;
-	if (prv->chipdoc_session.phase != IASECC_CHIPDOC_MF || !prv->chipdoc_session.channel ||
-			prv->chipdoc_session.clear_channel != chipdoc_crypto_clear)
-		return SC_ERROR_SM_NOT_INITIALIZED;
-	crypto = prv->chipdoc_session.channel;
-	generation = prv->chipdoc_session.generation;
-	if (!chipdoc_provider_matches(card, &crypto->provider) || crypto->card != card || crypto->reader != card->reader ||
-			crypto->generation != generation || crypto->sm.phase != JCOP4_SM_IDLE) {
-		result = SC_ERROR_CARD_RESET;
-		goto out;
-	}
+	rv = chipdoc_channel_live(card, prv, IASECC_CHIPDOC_MF, 0, &crypto, &generation);
+	if (rv == SC_ERROR_SM_NOT_INITIALIZED)
+		return rv;
+	if (rv)
+		goto fail;
 	/* Empty inner VERIFY: MAC only, no credential/DO87/DO97. */
-	if (jcop4_sm_seal_policy_ex(crypto->provider.libctx, &crypto->sm, query, NULL, 0, 0, 0,
-			    header, body, sizeof(body), &written, JCOP4_SM_LE_SHORT) ||
-			written != sizeof(body))
-		goto out;
-	sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x20, 0, 1);
-	apdu.cla = header[0];
-	apdu.data = body;
-	apdu.lc = apdu.datalen = written;
-	apdu.le = 256;
-	apdu.resp = response;
-	apdu.resplen = 256;
-	apdu.flags |= SC_APDU_FLAGS_NO_RETRY_WL | SC_APDU_FLAGS_NO_GET_RESP | SC_APDU_FLAGS_NO_SM;
-	report->commands = 1;
-	report->reset_required = 1;
-	rv = sc_transmit_apdu(card, &apdu);
-	report->transport = rv;
-	result = rv;
-	if (rv < 0)
-		goto out;
-	if (prv->chipdoc_session.channel != crypto || prv->chipdoc_session.generation != generation ||
-			!iasecc_chipdoc_transaction_owns(card, prv) || !chipdoc_provider_matches(card, &crypto->provider)) {
-		result = SC_ERROR_CARD_RESET;
-		goto out;
-	}
-	result = SC_ERROR_UNKNOWN_DATA_RECEIVED;
-	if (apdu.resplen > 256)
-		goto out;
-	size = apdu.resplen;
-	response[size++] = apdu.sw1;
-	response[size++] = apdu.sw2;
-	result = SC_ERROR_SM_AUTHENTICATION_FAILED;
-	if (jcop4_sm_open_report_policy_ex(crypto->provider.libctx, &crypto->sm, response, size, plain,
-			    sizeof(plain), &plain_size, &sw, JCOP4_SM_OUTER_9000_OR_MATCHING_63CX, &decoded))
-		goto out;
-	report->authenticated = 1;
-	report->sw = sw;
-	result = SC_ERROR_INVALID_DATA;
-	if (plain_size)
-		goto out;
-	result = SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
+	rv = chipdoc_verify_exchange(card, prv, crypto, generation, NULL, 0, &sw, report);
+	if (rv)
+		return rv;
+	rv = SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
 	if ((sw & 0xFFF0) != 0x63C0)
-		goto out;
+		goto fail;
 	*tries_left = sw & 15;
 	if (!*tries_left) {
-		result = SC_ERROR_AUTH_METHOD_BLOCKED;
-		goto out;
+		rv = SC_ERROR_AUTH_METHOD_BLOCKED;
+		goto fail;
 	}
-	result = iasecc_chipdoc_record(&prv->chipdoc_session, generation, IASECC_CHIPDOC_RESPONSE_QUERY, sw, 0, 0);
-out:
-	sc_mem_clear(header, sizeof(header));
-	sc_mem_clear(body, sizeof(body));
-	sc_mem_clear(response, sizeof(response));
-	sc_mem_clear(plain, sizeof(plain));
-	if (result)
-		iasecc_chipdoc_invalidate_card(card);
-	return result;
+	rv = iasecc_chipdoc_record(&prv->chipdoc_session, generation, IASECC_CHIPDOC_RESPONSE_QUERY, sw, 0, 0);
+	if (rv)
+		goto fail;
+	return SC_SUCCESS;
+fail:
+	iasecc_chipdoc_invalidate_card(card);
+	return rv;
 }
 
 int
@@ -843,24 +935,14 @@ iasecc_chipdoc_channel_verify_pin(struct sc_card *card, const struct sc_pin_cmd_
 {
 	struct iasecc_private_data *prv = NULL;
 	struct chipdoc_crypto *crypto;
-	const unsigned char verify[4] = {0, 0x20, 0, 1}, expected_ssc[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6};
-	unsigned char header[4], body[29], response[258], plain[256];
-	size_t written = 0, size, plain_size;
 	unsigned int sw;
 	uint64_t generation;
-	struct sc_apdu apdu;
-	struct jcop4_sm_decode_report decoded;
-	int rv, result = SC_ERROR_SM_ENCRYPT_FAILED;
+	int rv;
 	if (tries_left)
 		*tries_left = -1;
-	if (!report)
-		return SC_ERROR_INVALID_ARGUMENTS;
-	memset(report, 0, sizeof(*report));
-	if (!card || !card->driver || !card->driver->short_name || strcmp(card->driver->short_name, "iasecc"))
-		return SC_ERROR_NOT_SUPPORTED;
-	prv = card->drv_data;
-	if (prv)
-		report->reset_required = prv->chipdoc_transaction.active || prv->chipdoc_session.channel || prv->chipdoc_recovery_required;
+	rv = chipdoc_entry(card, report);
+	if (rv)
+		return rv;
 	if (!data || !tries_left)
 		return SC_ERROR_INVALID_ARGUMENTS;
 	if (data->cmd != SC_PIN_CMD_VERIFY)
@@ -868,13 +950,9 @@ iasecc_chipdoc_channel_verify_pin(struct sc_card *card, const struct sc_pin_cmd_
 	if (data->flags || data->pin_type != SC_AC_CHV || data->pin_reference != 1 || data->puk_reference ||
 			data->apdu || data->pin2.data || data->pin2.len || data->pin1.encoding != SC_PIN_ENCODING_ASCII)
 		return SC_ERROR_INVALID_ARGUMENTS;
-	rv = chipdoc_ready(card, &prv);
-	if (rv) {
-		iasecc_chipdoc_invalidate_card(card);
+	rv = chipdoc_channel_owned(card, &prv);
+	if (rv)
 		return rv;
-	}
-	if (!iasecc_chipdoc_transaction_owns(card, prv))
-		return SC_ERROR_NOT_ALLOWED;
 	if (prv->chipdoc_transaction.pin.minimum != 6 || prv->chipdoc_transaction.pin.maximum != 14 ||
 			prv->chipdoc_transaction.pin.format != SC_PKCS15_PIN_TYPE_UTF8 ||
 			prv->chipdoc_transaction.pin.flags != (SC_PKCS15_PIN_FLAG_CASE_SENSITIVE | SC_PKCS15_PIN_FLAG_INITIALIZED))
@@ -884,122 +962,45 @@ iasecc_chipdoc_channel_verify_pin(struct sc_card *card, const struct sc_pin_cmd_
 		return SC_ERROR_INVALID_ARGUMENTS;
 	if (!data->pin1.data || data->pin1.len < 6 || data->pin1.len > 14)
 		return SC_ERROR_INVALID_PIN_LENGTH;
-	if (prv->chipdoc_session.phase != IASECC_CHIPDOC_PIN_AVAILABLE || !prv->chipdoc_session.channel ||
-			prv->chipdoc_session.clear_channel != chipdoc_crypto_clear)
-		return SC_ERROR_SM_NOT_INITIALIZED;
-	crypto = prv->chipdoc_session.channel;
-	generation = prv->chipdoc_session.generation;
-	if (!chipdoc_provider_matches(card, &crypto->provider) || crypto->card != card || crypto->reader != card->reader ||
-			crypto->generation != generation || crypto->sm.phase != JCOP4_SM_IDLE ||
-			CRYPTO_memcmp(crypto->sm.keys.ssc, expected_ssc, sizeof(expected_ssc))) {
-		result = SC_ERROR_CARD_RESET;
-		goto out;
-	}
+	rv = chipdoc_channel_live(card, prv, IASECC_CHIPDOC_PIN_AVAILABLE, 6, &crypto, &generation);
+	if (rv == SC_ERROR_SM_NOT_INITIALIZED)
+		return rv;
+	if (rv)
+		goto fail;
 	/* No normalization/truncation/hash/credential padding or persistent copy.
 	 * The caller's borrowed bytes are read only after all session checks. */
 	for (size_t i = 0; i < data->pin1.len; i++)
 		if (data->pin1.data[i] < 0x20 || data->pin1.data[i] > 0x7E)
 			return SC_ERROR_INVALID_ARGUMENTS;
-	if (jcop4_sm_seal_policy_ex(crypto->provider.libctx, &crypto->sm, verify, data->pin1.data, data->pin1.len,
-			    0, 0, header, body, sizeof(body), &written, JCOP4_SM_LE_SHORT) ||
-			written != sizeof(body))
-		goto out;
 	/* Only encrypted DO87 and MAC reach the transport. Seal already cleans
 	 * its plaintext/padding temporary; caller remains owner of its input. */
-	sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x20, 0, 1);
-	apdu.cla = header[0];
-	apdu.data = body;
-	apdu.lc = apdu.datalen = written;
-	apdu.le = 256;
-	apdu.resp = response;
-	apdu.resplen = 256;
-	apdu.flags |= SC_APDU_FLAGS_NO_RETRY_WL | SC_APDU_FLAGS_NO_GET_RESP | SC_APDU_FLAGS_NO_SM;
-	report->commands = 1;
-	report->reset_required = 1;
-	rv = sc_transmit_apdu(card, &apdu);
-	report->transport = rv;
-	result = rv;
-	if (rv < 0)
-		goto out;
-	if (prv->chipdoc_session.channel != crypto || prv->chipdoc_session.generation != generation ||
-			!iasecc_chipdoc_transaction_owns(card, prv) || !chipdoc_provider_matches(card, &crypto->provider)) {
-		result = SC_ERROR_CARD_RESET;
-		goto out;
-	}
-	result = SC_ERROR_UNKNOWN_DATA_RECEIVED;
-	if (apdu.resplen > 256)
-		goto out;
-	size = apdu.resplen;
-	response[size++] = apdu.sw1;
-	response[size++] = apdu.sw2;
-	result = SC_ERROR_SM_AUTHENTICATION_FAILED;
-	if (jcop4_sm_open_report_policy_ex(crypto->provider.libctx, &crypto->sm, response, size, plain,
-			    sizeof(plain), &plain_size, &sw, JCOP4_SM_OUTER_9000_OR_MATCHING_63CX, &decoded))
-		goto out;
-	report->authenticated = 1;
-	report->sw = sw;
-	result = SC_ERROR_INVALID_DATA;
-	if (plain_size)
-		goto out;
+	rv = chipdoc_verify_exchange(card, prv, crypto, generation, data->pin1.data, data->pin1.len, &sw, report);
+	if (rv)
+		return rv;
 	if ((sw & 0xFFF0) == 0x63C0) {
 		*tries_left = sw & 15;
-		result = *tries_left ? SC_ERROR_PIN_CODE_INCORRECT : SC_ERROR_AUTH_METHOD_BLOCKED;
-		goto out;
+		rv = *tries_left ? SC_ERROR_PIN_CODE_INCORRECT : SC_ERROR_AUTH_METHOD_BLOCKED;
+		goto fail;
 	}
 	if (sw == 0x6983) {
-		result = SC_ERROR_AUTH_METHOD_BLOCKED;
-		goto out;
+		rv = SC_ERROR_AUTH_METHOD_BLOCKED;
+		goto fail;
 	}
 	if (sw == 0x6982) {
-		result = SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
-		goto out;
+		rv = SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
+		goto fail;
 	}
 	if (sw != 0x9000) {
-		result = SC_ERROR_CARD_CMD_FAILED;
-		goto out;
+		rv = SC_ERROR_CARD_CMD_FAILED;
+		goto fail;
 	}
-	result = iasecc_chipdoc_record(&prv->chipdoc_session, generation, IASECC_CHIPDOC_RESPONSE_LOGIN, sw, 0, 0);
-out:
-	sc_mem_clear(header, sizeof(header));
-	sc_mem_clear(body, sizeof(body));
-	sc_mem_clear(response, sizeof(response));
-	sc_mem_clear(plain, sizeof(plain));
-	if (result)
-		iasecc_chipdoc_invalidate_card(card);
-	return result;
-}
-
-/* Managed signing operations only. A phase mismatch is a local error; a
- * stale provider/SSC/owner is an invalid session, never an invitation to retry. */
-static int
-chipdoc_signing_ready(struct sc_card *card, enum iasecc_chipdoc_phase phase,
-		unsigned int counter, struct iasecc_private_data **data)
-{
-	struct iasecc_private_data *prv = NULL;
-	unsigned char expected[16] = {0};
-	int rv;
-	if (!card || !card->driver || !card->driver->short_name || strcmp(card->driver->short_name, "iasecc"))
-		return SC_ERROR_NOT_SUPPORTED;
-	rv = chipdoc_ready(card, &prv);
-	if (rv) {
-		iasecc_chipdoc_invalidate_card(card);
-		return rv;
-	}
-	if (!iasecc_chipdoc_transaction_owns(card, prv))
-		return SC_ERROR_NOT_ALLOWED;
-	if (prv->chipdoc_session.phase != phase || !prv->chipdoc_session.channel ||
-			prv->chipdoc_session.clear_channel != chipdoc_crypto_clear)
-		return SC_ERROR_SM_NOT_INITIALIZED;
-	struct chipdoc_crypto *crypto = prv->chipdoc_session.channel;
-	expected[15] = counter;
-	if (!chipdoc_provider_matches(card, &crypto->provider) || crypto->card != card || crypto->reader != card->reader ||
-			crypto->generation != prv->chipdoc_session.generation || crypto->sm.phase != JCOP4_SM_IDLE ||
-			CRYPTO_memcmp(crypto->sm.keys.ssc, expected, sizeof(expected))) {
-		iasecc_chipdoc_invalidate_card(card);
-		return SC_ERROR_CARD_RESET;
-	}
-	*data = prv;
+	rv = iasecc_chipdoc_record(&prv->chipdoc_session, generation, IASECC_CHIPDOC_RESPONSE_LOGIN, sw, 0, 0);
+	if (rv)
+		goto fail;
 	return SC_SUCCESS;
+fail:
+	iasecc_chipdoc_invalidate_card(card);
+	return rv;
 }
 
 /* Three fixed call sites below; not an arbitrary-command or plaintext API. */
@@ -1016,7 +1017,6 @@ chipdoc_signature_exchange(struct sc_card *card, enum iasecc_chipdoc_phase phase
 	unsigned int sw;
 	uint64_t generation;
 	struct sc_apdu apdu;
-	struct jcop4_sm_decode_report decoded;
 	int rv, result = SC_ERROR_SM_ENCRYPT_FAILED;
 	report->authenticated = 0;
 	report->sw = 0;
@@ -1067,7 +1067,7 @@ chipdoc_signature_exchange(struct sc_card *card, enum iasecc_chipdoc_phase phase
 							    ? JCOP4_SM_OUTER_PSO_STATUS_6A82
 							    : JCOP4_SM_OUTER_9000;
 	if (jcop4_sm_open_report_policy_ex(crypto->provider.libctx, &crypto->sm, response, size, plain, capacity,
-			    plain_size, &sw, policy, &decoded))
+			    plain_size, &sw, policy))
 		goto out;
 	report->authenticated = 1;
 	report->sw = sw;
@@ -1094,14 +1094,9 @@ iasecc_chipdoc_channel_select_application(struct sc_card *card,
 	const unsigned char select[4] = {0, 0xA4, 4, 0x0C};
 	const struct iasecc_chipdoc_profile *profile = iasecc_chipdoc_profile(IASECC_CHIPDOC_CR_RSA2048);
 	int rv;
-	if (!report)
-		return SC_ERROR_INVALID_ARGUMENTS;
-	memset(report, 0, sizeof(*report));
-	if (!card || !card->driver || !card->driver->short_name || strcmp(card->driver->short_name, "iasecc"))
-		return SC_ERROR_NOT_SUPPORTED;
-	prv = card->drv_data;
-	if (prv)
-		report->reset_required = prv->chipdoc_transaction.active || prv->chipdoc_session.channel || prv->chipdoc_recovery_required;
+	rv = chipdoc_entry(card, report);
+	if (rv)
+		return rv;
 	rv = chipdoc_signing_ready(card, IASECC_CHIPDOC_LOGGED_IN, 8, &prv);
 	if (rv)
 		return rv;
@@ -1128,14 +1123,9 @@ iasecc_chipdoc_channel_set_security_env(struct sc_card *card, const struct sc_se
 	const unsigned char mse[4] = {0, 0x22, 0x81, 0xB6}, mse_data[4] = {0x91, 2, 0x28, 0x91};
 	const struct iasecc_chipdoc_profile *profile = iasecc_chipdoc_profile(IASECC_CHIPDOC_CR_RSA2048);
 	int rv;
-	if (!report)
-		return SC_ERROR_INVALID_ARGUMENTS;
-	memset(report, 0, sizeof(*report));
-	if (!card || !card->driver || !card->driver->short_name || strcmp(card->driver->short_name, "iasecc"))
-		return SC_ERROR_NOT_SUPPORTED;
-	prv = card->drv_data;
-	if (prv)
-		report->reset_required = prv->chipdoc_transaction.active || prv->chipdoc_session.channel || prv->chipdoc_recovery_required;
+	rv = chipdoc_entry(card, report);
+	if (rv)
+		return rv;
 	if (!env)
 		return SC_ERROR_INVALID_ARGUMENTS;
 	if (se_num || env->flags != (SC_SEC_ENV_ALG_PRESENT | SC_SEC_ENV_KEY_REF_PRESENT) ||
@@ -1181,14 +1171,9 @@ iasecc_chipdoc_channel_compute_signature(struct sc_card *card,
 	size_t size;
 	const unsigned char pso[4] = {0, 0x2A, 0x9E, 0x9A};
 	int rv, closed;
-	if (!report)
-		return SC_ERROR_INVALID_ARGUMENTS;
-	memset(report, 0, sizeof(*report));
-	if (!card || !card->driver || !card->driver->short_name || strcmp(card->driver->short_name, "iasecc"))
-		return SC_ERROR_NOT_SUPPORTED;
-	prv = card->drv_data;
-	if (prv)
-		report->channel.reset_required = prv->chipdoc_transaction.active || prv->chipdoc_session.channel || prv->chipdoc_recovery_required;
+	rv = chipdoc_entry(card, &report->channel);
+	if (rv)
+		return rv;
 	if (!in || in_len != 32 || !out)
 		return SC_ERROR_INVALID_ARGUMENTS;
 	if (out_len < 256)

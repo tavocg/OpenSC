@@ -57,12 +57,4 @@ out:
 	return result;
 }
 
-/* Standalone helpers retain their default-context API. OpenSC must use _ex. */
-static inline int
-jcop4_ca_aes128_kdf(const unsigned char *secret, size_t size,
-		struct jcop4_channel_keys *keys)
-{
-	return jcop4_ca_aes128_kdf_ex(NULL, secret, size, keys);
-}
-
 #endif

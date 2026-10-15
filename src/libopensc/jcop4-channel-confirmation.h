@@ -143,7 +143,7 @@ jcop4_ca_confirm_d004_session_ex(OSSL_LIB_CTX *libctx, const unsigned char *init
 	if (report->transport)
 		goto out;
 	report->outcome = JCOP4_CA_PROTECTED_RESPONSE_FAILED;
-	if (received > sizeof(response) || jcop4_sm_open_report_policy_ex(libctx, &channel, response, received, plain, sizeof(plain), &plain_size, &inner_sw, JCOP4_SM_OUTER_9000, NULL))
+	if (received > sizeof(response) || jcop4_sm_open_report_policy_ex(libctx, &channel, response, received, plain, sizeof(plain), &plain_size, &inner_sw, JCOP4_SM_OUTER_9000))
 		goto out;
 	report->authenticated_response = 1;
 	report->sw = inner_sw;
@@ -174,25 +174,6 @@ out:
 	OPENSSL_cleanse(body, sizeof(body));
 	OPENSSL_cleanse(plain, sizeof(plain));
 	return result;
-}
-
-/* Standalone default-context compatibility. A retained channel from _ex
- * must continue using its original libctx; this function stores no provider. */
-static inline int
-jcop4_ca_confirm_d004_session(const unsigned char *initial, size_t initial_size,
-		enum jcop4_ca_outer_le outer_le, jcop4_ca_exchange exchange, void *context,
-		struct jcop4_ca_probe_report *report, struct jcop4_sm_channel *confirmed)
-{
-	return jcop4_ca_confirm_d004_session_ex(NULL, initial, initial_size, outer_le, exchange, context, report, confirmed);
-}
-
-/* Existing hardware probe never retains a channel or exposes session keys. */
-static inline int
-jcop4_ca_confirm_d004(const unsigned char *initial, size_t initial_size,
-		enum jcop4_ca_outer_le outer_le, jcop4_ca_exchange exchange, void *context,
-		struct jcop4_ca_probe_report *report)
-{
-	return jcop4_ca_confirm_d004_session(initial, initial_size, outer_le, exchange, context, report, NULL);
 }
 
 #endif

@@ -23,6 +23,8 @@ iasecc_chipdoc_pkcs15_validate(struct sc_pkcs15_card *p15, struct sc_pkcs15_obje
 		return SC_ERROR_NOT_SUPPORTED;
 	if (p15->flags & SC_PKCS15_CARD_FLAG_EMULATED)
 		return SC_ERROR_NOT_SUPPORTED;
+	/* Both queries also enumerate their DF: the object list is populated
+	 * lazily and the pinned key/PIN scan below reads it directly. */
 	int count = sc_pkcs15_get_objects(p15, SC_PKCS15_TYPE_PRKEY_RSA, objects, 32);
 	if (count < 0)
 		return count;

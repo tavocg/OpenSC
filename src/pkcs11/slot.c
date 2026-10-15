@@ -241,7 +241,6 @@ card_detect(sc_reader_t *reader, void **reader_states)
 
 again:
 	rc = sc_detect_card_presence(reader);
-	sc_api_metadata_trace(SC_API_CARD_PRESENCE, 0, (CK_RV)rc, 0, 0);
 	if (rc < 0) {
 		sc_log(context, "%s: failed, %s", reader->name, sc_strerror(rc));
 		return sc_to_cryptoki_error(rc, NULL);
@@ -538,8 +537,6 @@ CK_RV slot_token_removed(CK_SLOT_ID id)
 		return rv;
 
 	token_was_present = (slot->slot_info.flags & CKF_TOKEN_PRESENT);
-	sc_api_metadata_trace(SC_API_SLOT_TOKEN_REMOVED, 0, CKR_OK, id,
-			token_was_present ? 1 : 0);
 
 	/* Terminate active sessions */
 	sc_pkcs11_close_all_sessions(id);

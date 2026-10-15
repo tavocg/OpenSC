@@ -156,8 +156,6 @@ struct iasecc_private_data {
 	struct iasecc_se_info *se_info;
 
 	struct sc_card_cache cache;
-	/* Public fixed policy only; never cache login state or remaining tries here. */
-	int chipdoc_pin_max_tries;
 	/* Inactive until the separate ChipDoc adapter is connected to this driver. */
 	enum iasecc_chipdoc_profile_id chipdoc_profile;
 	struct iasecc_chipdoc_session chipdoc_session;
@@ -183,18 +181,19 @@ struct sc_pkcs15_object;
 int iasecc_chipdoc_pkcs15_validate(struct sc_pkcs15_card *p15, struct sc_pkcs15_object **key);
 int iasecc_chipdoc_pkcs15_activate(struct sc_pkcs15_card *p15);
 
+/* Generic PKI application AID shared by the Amos JCOP3 personalization. */
+#define IASECC_CHIPDOC_GENERIC_AID "\xE8\x28\xBD\x08\x0F\xD2\x50\x47\x65\x6E\x65\x72\x69\x63"
+#define IASECC_CHIPDOC_GENERIC_AID_LEN 14
+
 /* The existing Amos ATR match alone is insufficient: only the Generic PKI
  * application used by the JCOP3 patch needs these PKCS#15/session defaults. */
 static inline int
 iasecc_chipdoc_jcop3(const struct sc_card *card, const struct sc_aid *aid)
 {
-	static const unsigned char generic_aid[] = {
-		0xE8, 0x28, 0xBD, 0x08, 0x0F, 0xD2, 0x50,
-		0x47, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63
-	};
 	return card && card->driver && card->driver->short_name &&
 			!strcmp(card->driver->short_name, "iasecc") && card->type == SC_CARD_TYPE_IASECC_AMOS &&
-			aid && aid->len == sizeof(generic_aid) && !memcmp(aid->value, generic_aid, sizeof(generic_aid));
+			aid && aid->len == IASECC_CHIPDOC_GENERIC_AID_LEN &&
+			!memcmp(aid->value, IASECC_CHIPDOC_GENERIC_AID, IASECC_CHIPDOC_GENERIC_AID_LEN);
 }
 
 #endif

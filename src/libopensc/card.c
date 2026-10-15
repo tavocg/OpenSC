@@ -32,7 +32,6 @@
 #include "reader-tr03119.h"
 #include "internal.h"
 #include "asn1.h"
-#include "api-trace.h"
 #include "common/compat_strlcpy.h"
 
 #ifdef ENABLE_SM
@@ -442,8 +441,6 @@ int sc_reset(sc_card_t *card, int do_cold_reset)
 		return r;
 
 	r = card->reader->ops->reset(card->reader, do_cold_reset);
-	if (card->type == SC_CARD_TYPE_IASECC_AMOS)
-		sc_api_metadata_trace(SC_API_CARD_RESET, 0, (unsigned long)r, !!do_cold_reset, 0);
 
 	r2 = sc_mutex_unlock(card->ctx, card->mutex);
 	if (r2 != SC_SUCCESS) {
@@ -501,8 +498,6 @@ int sc_lock(sc_card_t *card)
 		if (SC_SUCCESS != card->ops->card_reader_lock_obtained(card, was_reset))
 			sc_log(card->ctx, "card_reader_lock_obtained failed");
 	}
-	if (card->type == SC_CARD_TYPE_IASECC_AMOS && (reader_lock_obtained || r || was_reset))
-		sc_api_metadata_trace(SC_API_CARD_LOCK, 0, (unsigned long)r, was_reset, reader_lock_obtained);
 
 	LOG_FUNC_RETURN(card->ctx, r);
 }

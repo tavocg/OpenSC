@@ -509,9 +509,6 @@ __pkcs15_delete_object(struct pkcs15_fw_data *fw_data, struct pkcs15_any_object 
 }
 #endif
 
-static int pkcs15_chipdoc_session_state(struct sc_pkcs15_card *,
-		struct sc_pkcs15_auth_info *, int);
-
 CK_RV C_GetTokenInfo(CK_SLOT_ID slotID, CK_TOKEN_INFO_PTR pInfo)
 {
 	struct sc_pkcs11_slot *slot;
@@ -527,7 +524,6 @@ CK_RV C_GetTokenInfo(CK_SLOT_ID slotID, CK_TOKEN_INFO_PTR pInfo)
 	if (rv != CKR_OK)
 		return rv;
 	sc_log(context, "C_GetTokenInfo(%lx)", slotID);
-	sc_api_metadata_trace(SC_API_TOKEN_INFO_BEGIN, 0, CKR_OK, slotID, 0);
 
 	rv = slot_get_token(slotID, &slot);
 	if (rv != CKR_OK)   {
@@ -567,18 +563,7 @@ CK_RV C_GetTokenInfo(CK_SLOT_ID slotID, CK_TOKEN_INFO_PTR pInfo)
 			goto out;
 		}
 
-		if (pkcs15_chipdoc_session_state(p15card, pin_info, slot->login_user)) {
-			/* Experimental: flags below use cached public retry metadata.
-			 * This is not a new physical PIN-status observation.
-			 */
-			sc_api_metadata_trace(SC_API_TOKEN_PIN_CACHED, 0, CKR_OK,
-					SC_PIN_STATE_UNKNOWN, (CK_ULONG)slot->login_user);
-		} else {
-			/* Preserve the existing behavior: the PIN-query result does not set rv. */
-			int pin_rv = sc_pkcs15_get_pin_info(p15card, auth);
-			sc_api_metadata_trace(SC_API_TOKEN_PIN_STATUS, 0, (CK_RV)pin_rv,
-					pin_info->logged_in, (CK_ULONG)slot->login_user);
-		}
+		sc_pkcs15_get_pin_info(p15card, auth);
 
 		if (pin_info->tries_left >= 0) {
 			if (pin_info->tries_left == 1 || pin_info->max_tries == 1)
@@ -600,7 +585,6 @@ out:
 		sc_log(context, "C_GetTokenInfo(%lx) returns %s", slotID, name);
 	else
 		sc_log(context, "C_GetTokenInfo(%lx) returns 0x%08lX", slotID, rv);
-	sc_api_metadata_trace(SC_API_TOKEN_INFO, 0, rv, slotID, 0);
 	sc_pkcs11_unlock();
 
 	return rv;
@@ -1372,35 +1356,6 @@ _is_slot_auth_object(struct sc_pkcs15_auth_info *pin_info)
 	return 1;
 }
 
-/* Isolated experiment, disabled by default. C_Login still verifies the PIN;
- * subsequent physical PIN queries from C_GetSessionInfo and C_GetTokenInfo
- * are suppressed. Token flags then use cached public retry metadata.
- * Returning UNKNOWN leaves session state governed by slot->login_user,
- * without claiming that the physical card's status was read.
- */
-static int
-pkcs15_chipdoc_session_state(struct sc_pkcs15_card *p15card,
-		struct sc_pkcs15_auth_info *pin_info, int login_user)
-{
-	static const unsigned char generic_aid[] = {
-		0xE8, 0x28, 0xBD, 0x08, 0x0F, 0xD2, 0x50,
-		0x47, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63
-	};
-	const char *mode = getenv("OPENSC_JCOP3_SESSION_STATE");
-
-	return mode && !strcmp(mode, "yes") && login_user == CKU_USER &&
-			p15card && p15card->card && p15card->app && pin_info &&
-			p15card->card->type == SC_CARD_TYPE_IASECC_AMOS &&
-			p15card->app->aid.len == sizeof(generic_aid) &&
-			!memcmp(p15card->app->aid.value, generic_aid, sizeof(generic_aid)) &&
-			pin_info->auth_type == SC_PKCS15_PIN_AUTH_TYPE_PIN &&
-			pin_info->auth_method == SC_AC_CHV && pin_info->attrs.pin.reference == 1 &&
-			!(pin_info->attrs.pin.flags & (SC_PKCS15_PIN_FLAG_LOCAL |
-			SC_PKCS15_PIN_FLAG_SO_PIN | SC_PKCS15_PIN_FLAG_UNBLOCKING_PIN)) &&
-			pin_info->path.type == SC_PATH_TYPE_FILE_ID && !pin_info->path.aid.len &&
-			pin_info->path.len == 2 && pin_info->path.value[0] == 0x3F && !pin_info->path.value[1];
-}
-
 int slot_get_logged_in_state(struct sc_pkcs11_slot *slot)
 {
 	int logged_in = SC_PIN_STATE_UNKNOWN;
@@ -1433,14 +1388,7 @@ int slot_get_logged_in_state(struct sc_pkcs11_slot *slot)
 	pin_info = (struct sc_pkcs15_auth_info *)pin_obj->data;
 	if (!pin_info)
 		goto out;
-	if (pkcs15_chipdoc_session_state(p15card, pin_info, slot->login_user)) {
-		sc_api_metadata_trace(SC_API_SESSION_LOGIN_STATE, 0, CKR_OK,
-				SC_PIN_STATE_UNKNOWN, (CK_ULONG)slot->login_user);
-		return SC_PIN_STATE_UNKNOWN;
-	}
 	pin_rv = sc_pkcs15_get_pin_info(p15card, pin_obj);
-	sc_api_metadata_trace(SC_API_PIN_STATUS, 0, (CK_RV)pin_rv,
-			pin_info->logged_in, (CK_ULONG)slot->login_user);
 	logged_in = pin_info->logged_in & ~SC_PIN_STATE_NEEDS_CHANGE;
 	if (iasecc_chipdoc_configured(p15card->card) &&
 			(pin_rv < 0 || logged_in != SC_PIN_STATE_LOGGED_IN)) {
@@ -4413,11 +4361,6 @@ pkcs15_prkey_sign(struct sc_pkcs11_session *session, void *obj,
 
 	if (prkey == NULL)
 		return CKR_KEY_FUNCTION_NOT_PERMITTED;
-
-	/* Public key metadata only, after resolving alternative key objects. */
-	sc_api_metadata_trace(SC_API_SIGN_KEY, session->handle, CKR_OK,
-			(CK_ULONG)prkey->prv_info->key_reference,
-			(CK_ULONG)prkey->prv_info->modulus_length);
 
 	switch (pMechanism->mechanism) {
 	case CKM_RSA_PKCS:
