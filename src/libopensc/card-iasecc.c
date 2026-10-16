@@ -2004,6 +2004,52 @@ iasecc_pin_get_status(struct sc_card *card, struct sc_pin_cmd_data *data)
 
 
 static int
+iasecc_chipdoc_fresh_verify(struct sc_card *card, const struct sc_pin_cmd_data *data)
+{
+	int i;
+
+	/* Empty VERIFY can still report an authenticated CHV after a root
+	 * selection has invalidated permission for the observed RSA operation.
+	 * For this detected profile, an explicit VERIFY must reach the card;
+	 * neither consult nor populate the legacy verified-PIN hash shortcut.
+	 * The normal policy read/validation remains before the actual VERIFY.
+	 */
+	if (!card || !data || data->cmd != SC_PIN_CMD_VERIFY ||
+			data->pin_type != SC_AC_CHV || data->pin_reference != 1)
+		return 0;
+	for (i = 0; i < card->app_count && i < SC_MAX_CARD_APPS; i++)
+		if (card->app[i] && iasecc_chipdoc_jcop3(card, &card->app[i]->aid))
+			return 1;
+	return 0;
+}
+
+
+static int
+iasecc_chipdoc_select_for_verify(struct sc_card *card,
+		const struct sc_pin_cmd_data *data, const struct iasecc_pin_policy *policy)
+{
+	struct sc_path path;
+	int rv;
+
+	if (!policy->read_verify_only || !iasecc_chipdoc_fresh_verify(card, data))
+		return SC_SUCCESS;
+
+	/* A different client can select the IAS root while this application's
+	 * PIN dialog is open. Root VERIFY may succeed without restoring the
+	 * observed RSA permission. For this detected profile, establish ChipDoc
+	 * after all root/policy selections and before the actual VERIFY. Never
+	 * recover by replaying a PIN after a failed signature.
+	 */
+	sc_format_path("", &path);
+	path.len = IASECC_CHIPDOC_GENERIC_AID_LEN;
+	memcpy(path.value, IASECC_CHIPDOC_GENERIC_AID, path.len);
+	path.type = SC_PATH_TYPE_DF_NAME;
+	rv = iasecc_select_file(card, &path, NULL);
+	return rv;
+}
+
+
+static int
 iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 {
 	struct sc_context *ctx = card->ctx;
@@ -2012,6 +2058,7 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 	struct sc_pin_cmd_data pin_cmd;
 	struct iasecc_pin_policy policy;
 	int tries_before_verify = -1;
+	int fresh_verify = iasecc_chipdoc_fresh_verify(card, data);
 	int rv;
 
 	LOG_FUNC_CALLED(ctx);
@@ -2051,7 +2098,7 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 		LOG_FUNC_RETURN(ctx, rv);
 
 	if (!rv)   {
-		if (pin_cmd.pin1.logged_in & SC_PIN_STATE_LOGGED_IN)
+		if (!fresh_verify && (pin_cmd.pin1.logged_in & SC_PIN_STATE_LOGGED_IN))
 			if (iasecc_chv_cache_is_verified(card, &pin_cmd))
 				LOG_FUNC_RETURN(ctx, SC_SUCCESS);
 	}
@@ -2071,6 +2118,9 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 			iasecc_set_pin_padding(&pin_cmd, &pin_cmd.pin1, policy.stored_length);
 	}
 
+	rv = iasecc_chipdoc_select_for_verify(card, &pin_cmd, &policy);
+	LOG_TEST_RET(ctx, rv, "Cannot select ChipDoc before VERIFY");
+
 	rv = iasecc_chv_verify(card, &pin_cmd, policy.scbs);
 
 	/*
@@ -2088,7 +2138,10 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
 
 	LOG_TEST_RET(ctx, rv, "PIN CHV verification error");
 
-	rv = iasecc_chv_cache_verified(card, &pin_cmd);
+	if (!fresh_verify) {
+		rv = iasecc_chv_cache_verified(card, &pin_cmd);
+		LOG_TEST_RET(ctx, rv, "Cannot record verified CHV");
+	}
 
 	LOG_FUNC_RETURN(ctx, rv);
 }
@@ -2188,6 +2241,10 @@ iasecc_pin_get_policy (struct sc_card *card, struct sc_pin_cmd_data *data, struc
 		LOG_TEST_GOTO_ERR(ctx, rv, "Cannot return to saved EF");
 	}
 
+	if (card->type == SC_CARD_TYPE_IASECC_AMOS && data->pin_reference == 1)
+		prv->chipdoc_pin_max_tries = pin->read_verify_only && pin->tries_maximum > 0
+				? pin->tries_maximum : 0;
+
 err:
 	sc_file_free(save_current_df);
 	sc_file_free(save_current_ef);
@@ -2205,6 +2262,17 @@ iasecc_pin_get_info(struct sc_card *card, struct sc_pin_cmd_data *data)
 
 	LOG_FUNC_CALLED(ctx);
 	sc_log(ctx, "iasecc_pin_get_info(card:%p)", card);
+	if (data->flags & IASECC_PIN_STATUS_ONLY) {
+		struct iasecc_private_data *prv = card->drv_data;
+		struct sc_pin_cmd_data verify = *data;
+		verify.cmd = SC_PIN_CMD_VERIFY;
+		if (!iasecc_chipdoc_fresh_verify(card, &verify) || !prv || prv->chipdoc_pin_max_tries <= 0)
+			return SC_ERROR_NOT_SUPPORTED;
+		rv = iasecc_pin_get_status(card, data);
+		if (rv == SC_SUCCESS)
+			data->pin1.max_tries = prv->chipdoc_pin_max_tries;
+		return rv;
+	}
 
 	/*
 	 * Get PIN status first and thereafter update with info from PIN policy, when available.

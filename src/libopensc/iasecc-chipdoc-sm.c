@@ -1137,6 +1137,7 @@ iasecc_chipdoc_channel_set_security_env(struct sc_card *card, const struct sc_se
 	for (size_t i = 0; i < SC_SEC_ENV_MAX_PARAMS; i++)
 		if (env->params[i].param_type || env->params[i].value || env->params[i].value_len)
 			return SC_ERROR_NOT_SUPPORTED;
+	prv = card->drv_data;
 	int selected = prv && prv->chipdoc_session.phase == IASECC_CHIPDOC_APPLICATION;
 	rv = chipdoc_signing_ready(card, selected ? IASECC_CHIPDOC_APPLICATION : IASECC_CHIPDOC_LOGGED_IN,
 			selected ? 10 : 8, &prv);

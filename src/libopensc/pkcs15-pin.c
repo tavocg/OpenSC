@@ -29,6 +29,7 @@
 #include "internal.h"
 #include "asn1.h"
 #include "pkcs15.h"
+#include "iasecc.h"
 #include "ui/notify.h"
 
 int _sc_pkcs15_verify_pin(struct sc_pkcs15_card *, struct sc_pkcs15_object *,
@@ -683,6 +684,21 @@ out:
 	LOG_FUNC_RETURN(ctx, r);
 }
 
+/* Detected Amos/Generic PKI global CHV1: preserve selection during status
+ * queries. Unknown policy still takes the original full initialization path. */
+static int chipdoc_pin_status_in_place(struct sc_pkcs15_card *p15card,
+		struct sc_pkcs15_auth_info *info)
+{
+	return p15card && p15card->app && info &&
+			iasecc_chipdoc_jcop3(p15card->card, &p15card->app->aid) &&
+			info->auth_type == SC_PKCS15_PIN_AUTH_TYPE_PIN && info->auth_method == SC_AC_CHV &&
+			info->attrs.pin.reference == 1 &&
+			!(info->attrs.pin.flags & (SC_PKCS15_PIN_FLAG_LOCAL | SC_PKCS15_PIN_FLAG_SO_PIN |
+			SC_PKCS15_PIN_FLAG_UNBLOCKING_PIN)) && info->path.type == SC_PATH_TYPE_FILE_ID &&
+			info->path.len == 2 && info->path.value[0] == 0x3F && !info->path.value[1] &&
+			!info->path.aid.len;
+}
+
 int sc_pkcs15_get_pin_info(struct sc_pkcs15_card *p15card,
 			 struct sc_pkcs15_object *pin_obj)
 {
@@ -695,12 +711,40 @@ int sc_pkcs15_get_pin_info(struct sc_pkcs15_card *p15card,
 	LOG_FUNC_CALLED(ctx);
 
 	r = sc_lock(card);
-	if (r != SC_SUCCESS)
+	if (r != SC_SUCCESS) {
+		if (chipdoc_pin_status_in_place(p15card, pin_info)) {
+			pin_info->tries_left = -1;
+			pin_info->logged_in = SC_PIN_STATE_UNKNOWN;
+		}
 		return r;
+	}
 
 	if (pin_info->auth_type != SC_PKCS15_PIN_AUTH_TYPE_PIN)   {
 		r = SC_ERROR_INVALID_DATA;
 		goto out;
+	}
+	if (chipdoc_pin_status_in_place(p15card, pin_info)) {
+		memset(&data, 0, sizeof(data));
+		data.cmd = SC_PIN_CMD_GET_INFO;
+		data.pin_type = pin_info->auth_method;
+		data.pin_reference = pin_info->attrs.pin.reference;
+		data.flags = IASECC_PIN_STATUS_ONLY;
+		r = sc_pin_cmd(card, &data);
+		/* Before the observed policy is known, retain the full initialization
+		 * query. After real VERIFY it is available; no reselection is needed.
+		 */
+		if (r != SC_ERROR_NOT_SUPPORTED) {
+			if (r == SC_SUCCESS) {
+				if (data.pin1.max_tries > 0)
+					pin_info->max_tries = data.pin1.max_tries;
+				pin_info->tries_left = data.pin1.tries_left;
+				pin_info->logged_in = data.pin1.logged_in;
+			} else {
+				pin_info->tries_left = -1;
+				pin_info->logged_in = SC_PIN_STATE_UNKNOWN;
+			}
+			goto out;
+		}
 	}
 
 	/* the path in the pin object is optional */

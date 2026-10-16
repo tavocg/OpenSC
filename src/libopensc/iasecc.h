@@ -156,6 +156,8 @@ struct iasecc_private_data {
 	struct iasecc_se_info *se_info;
 
 	struct sc_card_cache cache;
+	/* Public fixed policy only; never cache login state or remaining tries. */
+	int chipdoc_pin_max_tries;
 	/* Inactive until the separate ChipDoc adapter is connected to this driver. */
 	enum iasecc_chipdoc_profile_id chipdoc_profile;
 	struct iasecc_chipdoc_session chipdoc_session;
@@ -180,6 +182,9 @@ struct sc_pkcs15_card;
 struct sc_pkcs15_object;
 int iasecc_chipdoc_pkcs15_validate(struct sc_pkcs15_card *p15, struct sc_pkcs15_object **key);
 int iasecc_chipdoc_pkcs15_activate(struct sc_pkcs15_card *p15);
+
+/* Internal request: query current CHV state without changing selection. */
+#define IASECC_PIN_STATUS_ONLY 0x0008
 
 /* Generic PKI application AID shared by the Amos JCOP3 personalization. */
 #define IASECC_CHIPDOC_GENERIC_AID "\xE8\x28\xBD\x08\x0F\xD2\x50\x47\x65\x6E\x65\x72\x69\x63"
