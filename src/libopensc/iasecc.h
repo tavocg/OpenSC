@@ -62,6 +62,10 @@
 #define IASECC_OBJECT_REF_MIN	0x01
 #define IASECC_OBJECT_REF_MAX	0x1F
 
+/* JCOP3 'Generic' applet of the old BCCR/ChipDoc cards */
+#define IASECC_JCOP3_AID	{0xE8, 0x28, 0xBD, 0x08, 0x0F, 0xD2, 0x50, \
+				 0x47, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63}
+
 #define IASECC_SE_REF_MIN	0x01
 #define IASECC_SE_REF_MAX	0x0F
 
@@ -143,6 +147,13 @@ struct iasecc_private_data {
 	struct iasecc_se_info *se_info;
 
 	struct sc_card_cache cache;
+
+	/* JCOP3 'Generic' applet (old BCCR/ChipDoc cards) */
+	int jcop3;
+	unsigned char jcop3_kenc[16];
+	unsigned char jcop3_mack[16];
+	unsigned long jcop3_ssc;	/* SM session is open when non-zero */
+	unsigned jcop3_key_ref;		/* key selected by set_security_env() */
 };
 
 #endif

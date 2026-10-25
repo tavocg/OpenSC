@@ -752,6 +752,11 @@ int sc_pkcs15_compute_signature(struct sc_pkcs15_card *p15card,
 			memmove(tmp+modlen-inlen, tmp, inlen);
 			memset(tmp, 0, modlen-inlen);
 		}
+		else if (inlen > modlen) {
+			/* Refuse CKM_RSA_X_509 input longer than the modulus instead of truncating. */
+			r = SC_ERROR_WRONG_LENGTH;
+			goto err;
+		}
 		inlen = modlen;
 	}
 	/* PKCS#11 MECHANISMS V2.30: 6.3.1 EC Signatures

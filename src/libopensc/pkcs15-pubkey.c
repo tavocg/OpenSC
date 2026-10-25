@@ -685,6 +685,77 @@ sc_pkcs15_decode_pubkey_ec(sc_context_t *ctx,
 }
 
 
+/* ChipDoc EC key: SEQUENCE { [0] { OCTET STRING (DER OCTET STRING with
+ * the uncompressed point) }, SEQUENCE { OID (named curve) } }. */
+static int
+sc_pkcs15_decode_pubkey_ec_file(sc_context_t *ctx, struct sc_pkcs15_pubkey *key,
+		const u8 *buf, size_t buflen)
+{
+	const u8 *p, *end, *seq_end, *point_der, *params_end, *oid_der;
+	size_t len, point_der_len, oid_der_len;
+	unsigned int cla, tag;
+	int r;
+
+	LOG_FUNC_CALLED(ctx);
+
+	end = buf + buflen;
+
+
+	p = buf;
+	r = sc_asn1_read_tag(&p, end - p, &cla, &tag, &len);
+	if (r < 0 || cla != SC_ASN1_TAG_CONSTRUCTED || tag != SC_ASN1_TAG_SEQUENCE)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ASN1_OBJECT);
+	seq_end = p + len;
+
+
+	r = sc_asn1_read_tag(&p, seq_end - p, &cla, &tag, &len);
+	if (r < 0 || cla != (SC_ASN1_TAG_CONTEXT | SC_ASN1_TAG_CONSTRUCTED) || tag != 0)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ASN1_OBJECT);
+
+
+	r = sc_asn1_read_tag(&p, seq_end - p, &cla, &tag, &len);
+	if (r < 0 || cla != 0 || tag != SC_ASN1_TAG_OCTET_STRING)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ASN1_OBJECT);
+	point_der = p;
+	point_der_len = len;
+	p += len;
+
+
+	r = sc_asn1_read_tag(&p, seq_end - p, &cla, &tag, &len);
+	if (r < 0 || cla != SC_ASN1_TAG_CONSTRUCTED || tag != SC_ASN1_TAG_SEQUENCE)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ASN1_OBJECT);
+	params_end = p + len;
+
+	oid_der = p;
+	r = sc_asn1_read_tag(&p, params_end - p, &cla, &tag, &len);
+	if (r < 0 || cla != 0 || tag != SC_ASN1_TAG_OBJECT)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ASN1_OBJECT);
+	oid_der_len = (p - oid_der) + len;
+
+
+	r = sc_pkcs15_decode_pubkey_ec(ctx, &key->u.ec, point_der, point_der_len);
+	LOG_TEST_RET(ctx, r, "Failed to decode EC point");
+
+
+	key->u.ec.params.der.value = malloc(oid_der_len);
+	if (key->u.ec.params.der.value == NULL)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_OUT_OF_MEMORY);
+	memcpy(key->u.ec.params.der.value, oid_der, oid_der_len);
+	key->u.ec.params.der.len = oid_der_len;
+	r = sc_pkcs15_fix_ec_parameters(ctx, &key->u.ec.params);
+	LOG_TEST_RET(ctx, r, "Unsupported EC named curve");
+
+	key->alg_id = calloc(1, sizeof(struct sc_algorithm_id));
+	if (key->alg_id == NULL)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_OUT_OF_MEMORY);
+	key->alg_id->algorithm = SC_ALGORITHM_EC;
+	r = sc_format_oid(&key->alg_id->oid, "1.2.840.10045.2.1");
+	LOG_TEST_RET(ctx, r, "Failed to format ecPublicKey OID");
+
+	LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+}
+
+
 int
 sc_pkcs15_encode_pubkey_ec(sc_context_t *ctx, struct sc_pkcs15_pubkey_ec *key,
 		u8 **buf, size_t *buflen)
@@ -990,8 +1061,12 @@ sc_pkcs15_read_pubkey(struct sc_pkcs15_card *p15card, const struct sc_pkcs15_obj
 		LOG_TEST_GOTO_ERR(ctx, r, "Failed to read public key file.");
 
 		if ((algorithm == SC_ALGORITHM_EC || algorithm == SC_ALGORITHM_EDDSA || algorithm == SC_ALGORITHM_XEDDSA)
-				&& len > 0 && *data == (SC_ASN1_TAG_SEQUENCE | SC_ASN1_TAG_CONSTRUCTED))
+				&& len > 0 && *data == (SC_ASN1_TAG_SEQUENCE | SC_ASN1_TAG_CONSTRUCTED))   {
 			r = sc_pkcs15_pubkey_from_spki_sequence(ctx, data, len, &pubkey);
+			/* e.g. BCCR/eOI store this ChipDoc EC structure, not an X.509 SPKI. */
+			if (r < 0 && algorithm == SC_ALGORITHM_EC)
+				r = sc_pkcs15_decode_pubkey_ec_file(ctx, pubkey, data, len);
+		}
 		else
 			r = sc_pkcs15_decode_pubkey(ctx, pubkey, data, len);
 		LOG_TEST_GOTO_ERR(ctx, r, "Decode public key error");

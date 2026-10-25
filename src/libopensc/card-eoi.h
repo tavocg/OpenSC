@@ -38,6 +38,8 @@ struct eoi_privdata {
 	struct sc_path *pin_paths[MAX_OBJECTS];
 	/* PrKey reference to eOI mappings */
 	int prkey_mappings[MAX_OBJECTS][2];
+	/* ChipDoc cards (BCCR) use Chip Authentication instead of PACE. */
+	int chipdoc_ca;
 };
 
 /* Decrypt the 24-byte encrypted CAN blob into its 16-byte plaintext block;

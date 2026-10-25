@@ -29,6 +29,7 @@
 #include <stdlib.h>
 
 #include <openssl/bn.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
@@ -63,6 +64,15 @@
 		| SC_CARD_CAP_APDU_EXT			\
 		| SC_CARD_CAP_USE_FCI_AC		\
 		| SC_CARD_CAP_ISO7816_PIN_INFO)
+
+/* JCOP3 'Generic' applet (old BCCR/ChipDoc cards): PKCS#1 type 1 padding and
+ * raw RSA are done by the card; hashing/DigestInfo by OpenSC.  PSS and raw
+ * RSA use the raw-RSA mode with a complete block. */
+#define IASECC_JCOP3_RSA_FLAGS ( 0			\
+		| SC_ALGORITHM_RSA_PAD_PKCS1_TYPE_01	\
+		| SC_ALGORITHM_RSA_PAD_PSS		\
+		| SC_ALGORITHM_RSA_RAW			\
+		| SC_ALGORITHM_RSA_HASH_NONE)
 
 /* generic iso 7816 operations table */
 static const struct sc_card_operations *iso_ops = NULL;
@@ -153,6 +163,21 @@ static int iasecc_pin_merge_policy(struct sc_card *card, struct sc_pin_cmd_data 
 				   struct sc_pin_cmd_pin *pin, struct iasecc_pin_policy *policy);
 static int iasecc_get_free_reference(struct sc_card *card, struct iasecc_ctl_get_free_reference *ctl_data);
 static int iasecc_sdo_put_data(struct sc_card *card, struct iasecc_sdo_update *update);
+
+/* JCOP3 'Generic' applet of the old BCCR/ChipDoc cards */
+static int iasecc_jcop3_detect(struct sc_card *card);
+static int iasecc_jcop3_set_security_env(struct sc_card *card, const struct sc_security_env *env, int se_num);
+static int iasecc_jcop3_pin_cmd(struct sc_card *card, struct sc_pin_cmd_data *data);
+static int iasecc_jcop3_compute_signature(struct sc_card *card, const unsigned char *in, size_t in_len,
+		unsigned char *out, size_t out_len);
+static int iasecc_jcop3_compute_signature_pss(struct sc_card *card, const unsigned char *in, size_t in_len,
+		unsigned char *out, size_t out_len);
+static int iasecc_jcop3_decipher(struct sc_card *card, const unsigned char *in, size_t in_len,
+		unsigned char *out, size_t out_len);
+static int iasecc_jcop3_compute_signature_raw(struct sc_card *card, const unsigned char *in, size_t in_len,
+		unsigned char *out, size_t out_len);
+static int iasecc_jcop3_sdo_get_tagged_data(struct sc_card *card, const unsigned char *req,
+		size_t req_len, unsigned char *resp, size_t *resp_len);
 
 #ifdef ENABLE_SM
 static int _iasecc_sm_read_binary(struct sc_card *card, unsigned int offs, unsigned char *buf, size_t count);
@@ -667,11 +692,17 @@ iasecc_init(struct sc_card *card)
 		}
 
 		iasecc_get_serialnr(card, NULL);
+
+		if (card->type == SC_CARD_TYPE_IASECC_AMOS)
+			iasecc_jcop3_detect(card);
 	}
 
 #ifdef ENABLE_SM
-	card->sm_ctx.ops.read_binary = _iasecc_sm_read_binary;
-	card->sm_ctx.ops.update_binary = _iasecc_sm_update_binary;
+	/* the JCOP3 applet uses the secure messaging implemented in this driver */
+	if (!private_data->jcop3)   {
+		card->sm_ctx.ops.read_binary = _iasecc_sm_read_binary;
+		card->sm_ctx.ops.update_binary = _iasecc_sm_update_binary;
+	}
 #endif
 
 	if (!rv && card->ef_atr && card->ef_atr->aid.len)   {
@@ -874,6 +905,16 @@ iasecc_select_file(struct sc_card *card, const struct sc_path *path,
 	sc_log(ctx, "iasecc_select_file(card:%p) path.len %zu; path.type %i; aid_len %zu",
 			card, path->len, path->type, path->aid.len);
 	sc_log(ctx, "iasecc_select_file() path:%s", sc_print_path(path));
+
+	/* PINs are internal; AODF references CHV files 0001/0002 that don't exist
+	 * in the applet DF, so ignore their selection. */
+	if (prv->jcop3 && path->type == SC_PATH_TYPE_FILE_ID && path->len == 2
+			&& path->aid.len == 0 && path->value[0] == 0x00
+			&& (path->value[1] == 0x01 || path->value[1] == 0x02))   {
+		sc_log(ctx, "JCOP3: ignoring the selection of the PIN file %02X%02X",
+				path->value[0], path->value[1]);
+		LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+	}
 
 	if ((!iasecc_is_cpx(card)) &&
 	    (card->type != SC_CARD_TYPE_IASECC_GEMALTO) &&
@@ -1132,7 +1173,7 @@ iasecc_process_fci(struct sc_card *card, struct sc_file *file,
 	Gemalto:  6F 19 80 02 02 ED 82 01 01 83 02 B0 01 88 00	8C 07 7B 17 17 17 17 17 00 8A 01 05 90 00
 	Sagem:    6F 17 62 15 80 02 00 7D 82 01 01                   8C 02 01 00 83 02 2F 00 88 01 F0 8A 01 05 90 00
 	Oberthur: 62 1B 80 02 05 DC 82 01 01 83 02 B0 01 88 00 A1 09 8C 07 7B 17 FF 17 17 17 00 8A 01 05 90 00
-*/
+ */
 
 	sc_log(ctx, "iasecc_process_fci() type %i; let's parse file ACLs", file->type);
 	tag = sc_asn1_find_tag(ctx, buf, buflen, IASECC_DOCP_TAG_ACLS, &taglen);
@@ -1656,6 +1697,1003 @@ iasecc_se_get_info(struct sc_card *card, struct iasecc_se_info *se)
 }
 
 
+/*
+ * JCOP3 'Generic' applet (old BCCR/ChipDoc cards).  IAS/ECC based ('AMOS'
+ * ATR), but key operations use DF "Generic" with ISO 7816-4 SM (DH RFC 5114
+ * group 22, 3DES retail MAC).  Key data and PIN verification require that
+ * channel; the applet pads PKCS#1 v1.5 itself.
+ */
+
+static const unsigned char iasecc_jcop3_aid[] = IASECC_JCOP3_AID;
+
+/* RFC 5114 group 22 (1024-bit MODP with 160-bit prime order subgroup) */
+static const char iasecc_jcop3_dh_p[] =
+	"B10B8F96A080E01DDE92DE5EAE5D54EC52C99FBCFB06A3C6"
+	"9A6A9DCA52D23B616073E28675A23D189838EF1E2EE652C0"
+	"13ECB4AEA906112324975C3CD49B83BFACCBDD7D90C4BD70"
+	"98488E9C219A73724EFFD6FAE5644738FAA31A4FF55BCCC0"
+	"A151AF5F0DC8B4BD45BF37DF365C1A65E68CFDA76D4DA708"
+	"DF1FB2BC2E4A4371";
+static const char iasecc_jcop3_dh_g[] =
+	"A4D1CBD5C3FD34126765A442EFB99905F8104DD258AC507F"
+	"D6406CFF14266D31266FEA1E5C41564B777E690F5504F213"
+	"160217B4B01B886A5E91547F9E2749F4D7FBD7D3B9A92EE1"
+	"909D0D2263F80A76A6A24C087A091F531DBF0A0169B6A28A"
+	"D662A4D18E73AFA32D779D5918D08BC8858F4DCEF97C2A24"
+	"855E6EEB22B3B2E5";
+static const char iasecc_jcop3_dh_q[] =
+	"F518AA8781A8DF278ABA4E7D64B7CB9D49462353";
+
+static int
+iasecc_jcop3_select_applet(struct sc_card *card)
+{
+	struct sc_path path;
+	int rv;
+
+	memset(&path, 0, sizeof(path));
+	path.type = SC_PATH_TYPE_DF_NAME;
+	memcpy(path.value, iasecc_jcop3_aid, sizeof(iasecc_jcop3_aid));
+	path.len = sizeof(iasecc_jcop3_aid);
+
+	rv = iasecc_select_file(card, &path, NULL);
+	LOG_TEST_RET(card->ctx, rv, "cannot select the JCOP3 applet");
+
+	return SC_SUCCESS;
+}
+
+/* Triple-DES EDE (24 byte key) in CBC mode without padding. */
+static int
+iasecc_jcop3_3des_cbc(const unsigned char *key, const unsigned char *iv,
+		unsigned char *data, size_t len, int enc)
+{
+	EVP_CIPHER_CTX *cctx;
+	int out_len = 0, rv = SC_SUCCESS;
+
+	cctx = EVP_CIPHER_CTX_new();
+	if (!cctx)
+		return SC_ERROR_OUT_OF_MEMORY;
+
+	if ((enc ? EVP_EncryptInit_ex(cctx, EVP_des_ede3_cbc(), NULL, key, iv)
+		 : EVP_DecryptInit_ex(cctx, EVP_des_ede3_cbc(), NULL, key, iv)) != 1)   {
+		EVP_CIPHER_CTX_free(cctx);
+		return SC_ERROR_INTERNAL;
+	}
+	EVP_CIPHER_CTX_set_padding(cctx, 0);
+
+	if ((enc ? EVP_EncryptUpdate(cctx, data, &out_len, data, (int)len)
+		 : EVP_DecryptUpdate(cctx, data, &out_len, data, (int)len)) != 1
+			|| (size_t)out_len != len)
+		rv = SC_ERROR_INTERNAL;
+
+	EVP_CIPHER_CTX_free(cctx);
+	return rv;
+}
+
+
+static int
+iasecc_jcop3_crypt(const unsigned char *kenc, unsigned char *data, size_t len, int enc)
+{
+	unsigned char key24[24], iv[8] = {0};
+
+	memcpy(key24, kenc, 16);
+	memcpy(key24 + 16, kenc, 8);
+
+	return iasecc_jcop3_3des_cbc(key24, iv, data, len, enc);
+}
+
+/* Mandatory 0x80 + zero bytes padding (a full block is added when aligned). */
+static size_t
+iasecc_jcop3_pad2(const unsigned char *in, size_t in_len, unsigned char *out)
+{
+	size_t len = ((in_len / 8) + 1) * 8, i;
+
+	if (in != out)
+		memcpy(out, in, in_len);
+	out[in_len] = 0x80;
+	for (i = in_len + 1; i < len; i++)
+		out[i] = 0x00;
+
+	return len;
+}
+
+static size_t
+iasecc_jcop3_unpad2(unsigned char *buf, size_t len)
+{
+	while (len > 0 && buf[len - 1] == 0x00)
+		len--;
+	if (len > 0 && buf[len - 1] == 0x80)
+		len--;
+
+	return len;
+}
+
+/* ISO 9797-1 MAC algorithm 3 ('retail MAC') with the 16 byte key K1|K2. */
+static int
+iasecc_jcop3_mac(const unsigned char *keys, const unsigned char *data, size_t len,
+		unsigned char mac[8])
+{
+	unsigned char k24[24], iv[8] = {0}, phase1[8], block[8];
+	unsigned char *tmp;
+	size_t body_len;
+	int rv;
+
+	if (len < 16 || (len & 7))
+		return SC_ERROR_INVALID_ARGUMENTS;
+
+	body_len = len - 8;
+	tmp = malloc(body_len);
+	if (!tmp)
+		return SC_ERROR_OUT_OF_MEMORY;
+
+	/* phase 1: single DES CBC with K1 over all the blocks but the last one */
+	memcpy(tmp, data, body_len);
+	memcpy(k24, keys, 8);
+	memcpy(k24 + 8, keys, 8);
+	memcpy(k24 + 16, keys, 8);
+	rv = iasecc_jcop3_3des_cbc(k24, iv, tmp, body_len, 1);
+	if (rv == SC_SUCCESS)
+		memcpy(phase1, tmp + body_len - 8, 8);
+	free(tmp);
+	if (rv != SC_SUCCESS)
+		return rv;
+
+	/* phase 2: 3DES EDE with K1|K2|K1 over the last block */
+	memcpy(k24 + 8, keys + 8, 8);
+	memcpy(block, data + len - 8, 8);
+	rv = iasecc_jcop3_3des_cbc(k24, phase1, block, 8, 1);
+	if (rv == SC_SUCCESS)
+		memcpy(mac, block, 8);
+
+	return rv;
+}
+
+/* Key derivation used by the applet: Kenc = SHA1(Z|01)[:16], Kmac = SHA1(Z|02)[:16] */
+static int
+iasecc_jcop3_kdf(const unsigned char *z, unsigned char *kenc, unsigned char *mack)
+{
+	static const unsigned char counter1[4] = {0x00, 0x00, 0x00, 0x01};
+	static const unsigned char counter2[4] = {0x00, 0x00, 0x00, 0x02};
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int digest_len = 0;
+	EVP_MD_CTX *mdctx;
+	int rv = SC_SUCCESS;
+
+	mdctx = EVP_MD_CTX_new();
+	if (!mdctx)
+		return SC_ERROR_OUT_OF_MEMORY;
+
+	if (EVP_DigestInit_ex(mdctx, EVP_sha1(), NULL) != 1
+			|| EVP_DigestUpdate(mdctx, z, 128) != 1
+			|| EVP_DigestUpdate(mdctx, counter1, sizeof(counter1)) != 1
+			|| EVP_DigestFinal_ex(mdctx, digest, &digest_len) != 1
+			|| digest_len < 16)   {
+		rv = SC_ERROR_INTERNAL;
+	} else   {
+		memcpy(kenc, digest, 16);
+
+		if (EVP_DigestInit_ex(mdctx, EVP_sha1(), NULL) != 1
+				|| EVP_DigestUpdate(mdctx, z, 128) != 1
+				|| EVP_DigestUpdate(mdctx, counter2, sizeof(counter2)) != 1
+				|| EVP_DigestFinal_ex(mdctx, digest, &digest_len) != 1
+				|| digest_len < 16)   {
+			rv = SC_ERROR_INTERNAL;
+		} else   {
+			memcpy(mack, digest, 16);
+		}
+	}
+
+	EVP_MD_CTX_free(mdctx);
+	return rv;
+}
+
+static int
+iasecc_jcop3_bn2bin(const BIGNUM *bn, unsigned char *buf, int buf_len)
+{
+	return BN_bn2binpad(bn, buf, buf_len) == buf_len ? SC_SUCCESS : SC_ERROR_INTERNAL;
+}
+
+static void
+iasecc_jcop3_sm_close(struct sc_card *card)
+{
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+
+	if (!prv)
+		return;
+
+	memset(prv->jcop3_kenc, 0, sizeof(prv->jcop3_kenc));
+	memset(prv->jcop3_mack, 0, sizeof(prv->jcop3_mack));
+	prv->jcop3_ssc = 0;
+}
+
+/* Open a secure messaging channel: DH key agreement + key derivation. */
+static int
+iasecc_jcop3_sm_open(struct sc_card *card)
+{
+	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+	struct sc_apdu apdu;
+	BIGNUM *p = NULL, *g = NULL, *q = NULL, *q1 = NULL;
+	BIGNUM *x = NULL, *y = NULL, *yb = NULL, *z = NULL;
+	BN_CTX *bn_ctx = NULL;
+	unsigned char sbuf[0x100], rbuf[0x100];
+	unsigned char ybuf[128], zbuf[128];
+	size_t offs;
+	int rv;
+
+	LOG_FUNC_CALLED(ctx);
+
+	iasecc_jcop3_sm_close(card);
+
+	rv = iasecc_jcop3_select_applet(card);
+	LOG_TEST_GOTO_ERR(ctx, rv, "cannot select the JCOP3 applet");
+
+	bn_ctx = BN_CTX_new();
+	p = BN_new(); g = BN_new(); q = BN_new(); q1 = BN_new();
+	x = BN_new(); y = BN_new(); yb = BN_new(); z = BN_new();
+	if (!bn_ctx || !p || !g || !q || !q1 || !x || !y || !yb || !z)   {
+		rv = SC_ERROR_OUT_OF_MEMORY;
+		goto err;
+	}
+
+	if (!BN_hex2bn(&p, iasecc_jcop3_dh_p)
+			|| !BN_hex2bn(&g, iasecc_jcop3_dh_g)
+			|| !BN_hex2bn(&q, iasecc_jcop3_dh_q))   {
+		rv = SC_ERROR_INTERNAL;
+		goto err;
+	}
+
+	/* ephemeral private/public key pair */
+	if (!BN_sub(q1, q, BN_value_one())
+			|| !BN_rand_range(x, q1)
+			|| !BN_add_word(x, 1)
+			|| !BN_mod_exp(y, g, x, p, bn_ctx))   {
+		rv = SC_ERROR_INTERNAL;
+		goto err;
+	}
+	rv = iasecc_jcop3_bn2bin(y, ybuf, sizeof(ybuf));
+	if (rv != SC_SUCCESS)
+		goto err;
+
+	/* MSE: SET AT */
+	offs = 0;
+	memcpy(sbuf + offs, "\x80\x01\x1B\x83\x01\x8E\x91\x81\x80", 9);
+	offs += 9;
+	memcpy(sbuf + offs, ybuf, sizeof(ybuf));
+	offs += sizeof(ybuf);
+
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, 0x22, 0x41, 0xA6);
+	apdu.lc = offs;
+	apdu.datalen = offs;
+	apdu.data = sbuf;
+	rv = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_GOTO_ERR(ctx, rv, "MSE SET AT transmit failed");
+	rv = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_GOTO_ERR(ctx, rv, "MSE SET AT failed");
+
+	/* GET DATA: card's public key */
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0xCB, 0x3F, 0xFF);
+	memcpy(sbuf, "\x4D\x04\xA6\x02\x91\x00", 6);
+	apdu.lc = 6;
+	apdu.datalen = 6;
+	apdu.data = sbuf;
+	apdu.resp = rbuf;
+	apdu.resplen = sizeof(rbuf);
+	apdu.le = sizeof(rbuf);
+
+	rv = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_GOTO_ERR(ctx, rv, "GET DATA transmit failed");
+	rv = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_GOTO_ERR(ctx, rv, "GET DATA failed");
+
+	if (apdu.resplen != 134 || memcmp(rbuf, "\xA6\x81\x83", 3))   {
+		sc_log(ctx, "unexpected card public key data (len %zu)", apdu.resplen);
+		rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+		goto err;
+	}
+
+	if (!BN_bin2bn(rbuf + apdu.resplen - 128, 128, yb)
+			|| BN_cmp(yb, BN_value_one()) <= 0 || BN_cmp(yb, p) >= 0
+			|| !BN_mod_exp(z, yb, x, p, bn_ctx))   {
+		rv = SC_ERROR_INTERNAL;
+		goto err;
+	}
+	rv = iasecc_jcop3_bn2bin(z, zbuf, sizeof(zbuf));
+	if (rv != SC_SUCCESS)
+		goto err;
+
+	rv = iasecc_jcop3_kdf(zbuf, prv->jcop3_kenc, prv->jcop3_mack);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM key derivation failed");
+
+	prv->jcop3_ssc = 1;	/* the first SM message uses SSC 2 */
+
+	rv = SC_SUCCESS;
+err:
+	BN_clear_free(p); BN_clear_free(g); BN_clear_free(q); BN_clear_free(q1);
+	BN_clear_free(x); BN_clear_free(y); BN_clear_free(yb); BN_clear_free(z);
+	BN_CTX_free(bn_ctx);
+	memset(ybuf, 0, sizeof(ybuf));
+	memset(zbuf, 0, sizeof(zbuf));
+	if (rv != SC_SUCCESS)
+		iasecc_jcop3_sm_close(card);
+	LOG_FUNC_RETURN(ctx, rv);
+}
+
+#define IASECC_JCOP3_SM_BUF_SIZE	0x300
+
+static size_t
+iasecc_jcop3_tlv(unsigned char *buf, size_t buf_size, unsigned tag,
+		const unsigned char *val, size_t val_len)
+{
+	u8 *ptr = buf;
+
+	if (sc_asn1_put_tag(tag, val, val_len, buf, buf_size, &ptr) != SC_SUCCESS)
+		return 0;
+	return (size_t)(ptr - buf);
+}
+
+/*
+ * Send one SM command: 'cla' also goes into the MAC (chained PSO uses 0x1C);
+ * data goes in DO87, do85 in DO85, optional DO97.  Return the decrypted
+ * payloads and the inner status word.
+ */
+static int
+iasecc_jcop3_sm_cmd(struct sc_card *card, unsigned cla,
+		unsigned ins, unsigned p1, unsigned p2,
+		const unsigned char *data, size_t data_len,
+		const unsigned char *do85, size_t do85_len, int with_le,
+		unsigned char *rdata, size_t *rdata_len,
+		unsigned char *rdo85, size_t *rdo85_len,
+		unsigned *sw_out)
+{
+	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+	struct sc_apdu apdu;
+	unsigned char hdr[4], ssc[8], mac[8], rmac[8];
+	unsigned char sbuf[IASECC_JCOP3_SM_BUF_SIZE];
+	unsigned char rbuf[IASECC_JCOP3_SM_BUF_SIZE];
+	unsigned char tmp[IASECC_JCOP3_SM_BUF_SIZE];
+	unsigned char fbuf[IASECC_JCOP3_SM_BUF_SIZE];
+	const unsigned char *do87_val = NULL, *do85_val = NULL;
+	size_t offs, total, f_len, t_len, do87_vlen = 0, do85_vlen = 0;
+	size_t i, tlv_len, tlv_hdr;
+	unsigned long ssc_val;
+	unsigned sw = 0;
+	int rv = SC_ERROR_INTERNAL, has_mac = 0;
+
+	LOG_FUNC_CALLED(ctx);
+
+	if (!prv->jcop3_ssc)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_SECURITY_STATUS_NOT_SATISFIED);
+
+
+	offs = 0;
+	if (data_len)   {
+		if (data_len + 9 > sizeof(tmp))   {
+			rv = SC_ERROR_INVALID_ARGUMENTS;
+			goto err;
+		}
+		t_len = iasecc_jcop3_pad2(data, data_len, tmp + 1);
+		tmp[0] = 0x01;
+		rv = iasecc_jcop3_crypt(prv->jcop3_kenc, tmp + 1, t_len, 1);
+		if (rv != SC_SUCCESS)
+			goto err;
+		offs += iasecc_jcop3_tlv(sbuf + offs, sizeof(sbuf) - offs, IASECC_SM_DO_TAG_TCG, tmp, t_len + 1);
+	}
+	if (do85_len)   {
+		if (do85_len + 8 > sizeof(tmp))   {
+			rv = SC_ERROR_INVALID_ARGUMENTS;
+			goto err;
+		}
+		t_len = iasecc_jcop3_pad2(do85, do85_len, tmp);
+		rv = iasecc_jcop3_crypt(prv->jcop3_kenc, tmp, t_len, 1);
+		if (rv != SC_SUCCESS)
+			goto err;
+		offs += iasecc_jcop3_tlv(sbuf + offs, sizeof(sbuf) - offs, IASECC_SM_DO_TAG_TCG_ODD_INS, tmp, t_len);
+	}
+	if (with_le)   {
+		sbuf[offs++] = IASECC_SM_DO_TAG_TLE;
+		sbuf[offs++] = 0x01;
+		sbuf[offs++] = 0x00;
+	}
+
+	/* command MAC: SSC || pad2(header) || pad2(data objects) */
+	prv->jcop3_ssc++;
+	ssc_val = prv->jcop3_ssc;
+	for (i = 0; i < 8; i++)   {
+		ssc[7 - i] = ssc_val & 0xFF;
+		ssc_val >>= 8;
+	}
+
+	hdr[0] = cla;
+	hdr[1] = ins;
+	hdr[2] = p1;
+	hdr[3] = p2;
+	memcpy(tmp, ssc, 8);
+	t_len = 8 + iasecc_jcop3_pad2(hdr, 4, tmp + 8);
+	t_len += iasecc_jcop3_pad2(sbuf, offs, tmp + t_len);
+	rv = iasecc_jcop3_mac(prv->jcop3_mack, tmp, t_len, mac);
+	if (rv != SC_SUCCESS)
+		goto err;
+
+	offs += iasecc_jcop3_tlv(sbuf + offs, sizeof(sbuf) - offs, IASECC_SM_DO_TAG_TCC, mac, 8);
+
+
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, ins, p1, p2);
+	apdu.cla = cla;
+	apdu.data = sbuf;
+	apdu.datalen = offs;
+	apdu.lc = offs;
+	apdu.resp = rbuf;
+	apdu.resplen = sizeof(rbuf);
+	apdu.le = 256;	/* more data (if any) will be fetched with GET RESPONSE */
+
+	rv = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM command transmit failed");
+
+	/* sc_transmit_apdu() has already followed any 0x61xx with GET RESPONSE */
+	total = apdu.resplen;
+
+	if (apdu.sw1 != 0x90 || apdu.sw2 != 0x00)   {
+		rv = sc_check_sw(card, apdu.sw1, apdu.sw2);
+		LOG_TEST_GOTO_ERR(ctx, rv, "SM command failed");
+	}
+
+
+	prv->jcop3_ssc++;
+	ssc_val = prv->jcop3_ssc;
+	for (i = 0; i < 8; i++)   {
+		ssc[7 - i] = ssc_val & 0xFF;
+		ssc_val >>= 8;
+	}
+
+	offs = 0;
+	f_len = 0;
+	while (offs < total)   {
+		const unsigned char *tlv = rbuf + offs;
+		unsigned int tlv_cla, tlv_tag, tlv_id;
+
+		rv = sc_asn1_read_tag(&tlv, total - offs, &tlv_cla, &tlv_tag, &tlv_len);
+		if (rv != SC_SUCCESS || tlv == NULL)   {
+			rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+			goto err;
+		}
+		tlv_hdr = (size_t)(tlv - (rbuf + offs));
+		tlv_id = tlv_cla | tlv_tag;
+
+		if (tlv_id == IASECC_CARD_ANSWER_TAG_MAC)   {
+			if (tlv_len != 8)   {
+				rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+				goto err;
+			}
+			memcpy(rmac, tlv, 8);
+			has_mac = 1;
+		} else   {
+			memcpy(fbuf + f_len, rbuf + offs, tlv_hdr + tlv_len);
+			f_len += tlv_hdr + tlv_len;
+			if (tlv_id == IASECC_CARD_ANSWER_TAG_DATA)   {
+				do87_val = tlv;
+				do87_vlen = tlv_len;
+			} else if (tlv_id == IASECC_SM_DO_TAG_TCG_ODD_INS)   {
+				do85_val = tlv;
+				do85_vlen = tlv_len;
+			} else if (tlv_id == IASECC_CARD_ANSWER_TAG_SW)   {
+				if (tlv_len != 2)   {
+					rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+					goto err;
+				}
+				sw = (tlv[0] << 8) | tlv[1];
+			}
+		}
+
+		offs += tlv_hdr + tlv_len;
+	}
+
+	if (!has_mac)   {
+		sc_log(ctx, "no DO8E in the SM response");
+		rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+		goto err;
+	}
+
+	memcpy(tmp, ssc, 8);
+	t_len = 8 + iasecc_jcop3_pad2(fbuf, f_len, tmp + 8);
+	rv = iasecc_jcop3_mac(prv->jcop3_mack, tmp, t_len, mac);
+	if (rv != SC_SUCCESS)
+		goto err;
+	if (CRYPTO_memcmp(mac, rmac, 8) != 0)   {
+		sc_log(ctx, "SM response MAC mismatch");
+		rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+		goto err;
+	}
+
+
+	if (do87_val && rdata)   {
+		if (!do87_vlen || do87_val[0] != 0x01 || (do87_vlen - 1) > sizeof(tmp))   {
+			rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+			goto err;
+		}
+		t_len = do87_vlen - 1;
+		memcpy(tmp, do87_val + 1, t_len);
+		rv = iasecc_jcop3_crypt(prv->jcop3_kenc, tmp, t_len, 0);
+		if (rv != SC_SUCCESS)
+			goto err;
+		t_len = iasecc_jcop3_unpad2(tmp, t_len);
+		if (t_len > *rdata_len)   {
+			rv = SC_ERROR_BUFFER_TOO_SMALL;
+			goto err;
+		}
+		memcpy(rdata, tmp, t_len);
+		*rdata_len = t_len;
+	}
+	if (do85_val && rdo85)   {
+		if (do85_vlen > sizeof(tmp))   {
+			rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+			goto err;
+		}
+		t_len = do85_vlen;
+		memcpy(tmp, do85_val, t_len);
+		rv = iasecc_jcop3_crypt(prv->jcop3_kenc, tmp, t_len, 0);
+		if (rv != SC_SUCCESS)
+			goto err;
+		t_len = iasecc_jcop3_unpad2(tmp, t_len);
+		if (t_len > *rdo85_len)   {
+			rv = SC_ERROR_BUFFER_TOO_SMALL;
+			goto err;
+		}
+		memcpy(rdo85, tmp, t_len);
+		*rdo85_len = t_len;
+	}
+
+	if (sw_out)
+		*sw_out = sw;
+
+	rv = SC_SUCCESS;
+err:
+	memset(sbuf, 0, sizeof(sbuf));
+	memset(tmp, 0, sizeof(tmp));
+	memset(fbuf, 0, sizeof(fbuf));
+	LOG_FUNC_RETURN(ctx, rv);
+}
+
+static int
+iasecc_jcop3_check_sw(unsigned sw, int *tries_left)
+{
+	if (sw == 0x9000)
+		return SC_SUCCESS;
+
+	if ((sw & 0xFFF0) == 0x63C0)   {
+		if (tries_left)
+			*tries_left = sw & 0x0F;
+		return SC_ERROR_PIN_CODE_INCORRECT;
+	}
+
+	switch (sw)   {
+	case 0x6982:
+	case 0x6985:
+		return SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
+	case 0x6983:
+		return SC_ERROR_AUTH_METHOD_BLOCKED;
+	case 0x6A80:
+	case 0x6A86:
+		return SC_ERROR_INVALID_ARGUMENTS;
+	case 0x6A88:
+		return SC_ERROR_DATA_OBJECT_NOT_FOUND;
+	}
+
+	return SC_ERROR_CARD_CMD_FAILED;
+}
+
+/* Best effort: the card may be a plain IAS/ECC card. */
+static int
+iasecc_jcop3_detect(struct sc_card *card)
+{
+	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+	struct sc_path path;
+	static const unsigned char needle[5] = {'J', 'C', 'O', 'P', '3'};
+	unsigned char buf[64];
+	size_t i;
+	int rv;
+
+	LOG_FUNC_CALLED(ctx);
+
+	rv = iasecc_jcop3_select_applet(card);
+	if (rv != SC_SUCCESS)   {
+		sc_log(ctx, "JCOP3 applet is not present: %i", rv);
+		sc_invalidate_cache(card);
+		LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+	}
+
+	memset(&path, 0, sizeof(path));
+	path.type = SC_PATH_TYPE_FILE_ID;
+	path.value[0] = 0x50;
+	path.value[1] = 0x32;
+	path.len = 2;
+
+	rv = iasecc_select_file(card, &path, NULL);
+	if (rv == SC_SUCCESS)
+		rv = sc_read_binary(card, 0, buf, sizeof(buf), 0);
+	if (rv > 0)   {
+		for (i = 0; i + sizeof(needle) <= (size_t)rv; i++)   {
+			if (!memcmp(buf + i, needle, sizeof(needle)))   {
+				prv->jcop3 = 1;
+				break;
+			}
+		}
+	}
+
+	if (prv->jcop3)   {
+		card->caps |= SC_CARD_CAP_RAW_RSA_DECIPHER;
+
+		free(card->algorithms);
+		card->algorithms = NULL;
+		card->algorithm_count = 0;
+		sc_log(ctx, "JCOP3 applet detected: replacing the algorithm info");
+		_sc_card_add_rsa_alg(card, 1024, IASECC_JCOP3_RSA_FLAGS, 0x10001);
+		_sc_card_add_rsa_alg(card, 2048, IASECC_JCOP3_RSA_FLAGS, 0x10001);
+	} else   {
+		sc_log(ctx, "JCOP3 applet not detected");
+	}
+
+	sc_invalidate_cache(card);
+
+	LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+}
+
+static int
+iasecc_jcop3_set_security_env(struct sc_card *card, const struct sc_security_env *env, int se_num)
+{
+	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+	unsigned ref;
+
+	(void)se_num;
+	LOG_FUNC_CALLED(ctx);
+	sc_log(ctx, "JCOP3 set security env: operation 0x%X, algorithm 0x%lX, flags 0x%lX, key_ref 0x%X",
+			env->operation, env->algorithm, env->algorithm_flags, env->key_ref[0]);
+
+	if (env->algorithm != SC_ALGORITHM_RSA)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	if (env->algorithm_flags & SC_ALGORITHM_RSA_PAD_PSS)   {
+		unsigned long mgf = env->algorithm_flags & SC_ALGORITHM_MGF1_HASHES;
+
+		/* PSS needs a complete block and exactly one MGF1 hash. */
+		if (!mgf || (mgf & (mgf - 1)))
+			LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	}
+	else if (!(env->algorithm_flags & (SC_ALGORITHM_RSA_PAD_PKCS1_TYPE_01 |
+			SC_ALGORITHM_RSA_RAW)))
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	if (env->operation != SC_SEC_OPERATION_SIGN &&
+			env->operation != SC_SEC_OPERATION_DECIPHER)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	if (env->operation == SC_SEC_OPERATION_DECIPHER &&
+			(env->algorithm_flags & SC_ALGORITHM_RSA_PAD_PSS))
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+
+	ref = env->key_ref[0] & ~IASECC_OBJECT_REF_LOCAL;
+	if (!ref || ref > IASECC_OBJECT_REF_MAX)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ARGUMENTS);
+
+	prv->jcop3_key_ref = ref;
+	prv->security_env = *env;
+
+	LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+}
+
+static int
+iasecc_jcop3_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data)
+{
+	struct sc_context *ctx = card->ctx;
+	const unsigned char *pin;
+	unsigned sw = 0;
+	int rv;
+
+	LOG_FUNC_CALLED(ctx);
+	sc_log(ctx, "JCOP3 VERIFY(ref:%u; len:%zu)",
+			data->pin_reference, data->pin1.len);
+
+	if (data->pin1.len == 0 || data->pin1.len > 64 || !data->pin1.data)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ARGUMENTS);
+
+	pin = data->pin1.data + data->pin1.offset;
+
+	rv = iasecc_jcop3_sm_open(card);
+	LOG_TEST_GOTO_ERR(ctx, rv, "cannot open SM session");
+
+	rv = iasecc_jcop3_sm_cmd(card, 0x0C, 0x20, 0x00, data->pin_reference,
+			pin, data->pin1.len, NULL, 0, 0,
+			NULL, NULL, NULL, NULL, &sw);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM VERIFY failed");
+
+	rv = iasecc_jcop3_check_sw(sw, &data->pin1.tries_left);
+	LOG_TEST_GOTO_ERR(ctx, rv, "JCOP3 VERIFY failed");
+
+	rv = SC_SUCCESS;
+err:
+	iasecc_jcop3_sm_close(card);
+	LOG_FUNC_RETURN(ctx, rv);
+}
+
+static int
+iasecc_jcop3_pin_cmd(struct sc_card *card, struct sc_pin_cmd_data *data)
+{
+	int rv;
+
+	switch (data->cmd)   {
+	case SC_PIN_CMD_VERIFY:
+		rv = iasecc_jcop3_pin_verify(card, data);
+		break;
+	default:
+		rv = SC_ERROR_NOT_SUPPORTED;
+	}
+
+	return rv;
+}
+
+static int
+iasecc_jcop3_compute_signature(struct sc_card *card,
+		const unsigned char *in, size_t in_len, unsigned char *out, size_t out_len)
+{
+	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+	unsigned char selkey[6];
+	unsigned char sig[512];
+	size_t sig_len = sizeof(sig);
+	unsigned sw = 0;
+	int rv;
+
+	LOG_FUNC_CALLED(ctx);
+	sc_log(ctx, "JCOP3 compute signature: key_ref 0x%X, in_len %zu",
+			prv->jcop3_key_ref, in_len);
+
+	if (!prv->jcop3_key_ref)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ARGUMENTS);
+
+	if (prv->security_env.algorithm_flags & SC_ALGORITHM_RSA_RAW)
+		return iasecc_jcop3_compute_signature_raw(card, in, in_len, out, out_len);
+	if (prv->security_env.algorithm_flags & SC_ALGORITHM_RSA_PAD_PSS)
+		return iasecc_jcop3_compute_signature_pss(card, in, in_len, out, out_len);
+
+
+	if (in_len == 0 || in_len > 245)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ARGUMENTS);
+
+	rv = iasecc_jcop3_sm_open(card);
+	LOG_TEST_GOTO_ERR(ctx, rv, "cannot open SM session");
+
+
+	selkey[0] = 0x80;					/* algorithm reference */
+	selkey[1] = 0x01;
+	selkey[2] = IASECC_ALGORITHM_RSA_PKCS;			/* RSA PKCS#1 */
+	selkey[3] = 0x84;					/* key reference */
+	selkey[4] = 0x01;
+	selkey[5] = IASECC_OBJECT_REF_LOCAL | prv->jcop3_key_ref;
+
+	rv = iasecc_jcop3_sm_cmd(card, 0x0C, 0x22, 0x41, 0xA4, selkey, sizeof(selkey), NULL, 0, 0,
+			NULL, NULL, NULL, NULL, &sw);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM SET KEY failed");
+	rv = iasecc_jcop3_check_sw(sw, NULL);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SET KEY refused by the card");
+
+
+	rv = iasecc_jcop3_sm_cmd(card, 0x0C, 0x88, 0x00, 0x00, in, in_len, NULL, 0, 1,
+			sig, &sig_len, NULL, NULL, &sw);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM INTERNAL AUTHENTICATE failed");
+	rv = iasecc_jcop3_check_sw(sw, NULL);
+	LOG_TEST_GOTO_ERR(ctx, rv, "INTERNAL AUTHENTICATE refused by the card");
+
+	if (!sig_len || sig_len > out_len)   {
+		rv = SC_ERROR_BUFFER_TOO_SMALL;
+		goto err;
+	}
+
+	memcpy(out, sig, sig_len);
+	rv = (int)sig_len;
+
+err:
+	iasecc_jcop3_sm_close(card);
+	LOG_FUNC_RETURN(ctx, rv);
+}
+
+/* Run a complete raw-RSA block through MSE:SET DST and two chained PSOs. */
+static int
+iasecc_jcop3_raw_rsa(struct sc_card *card,
+		const unsigned char *in, size_t in_len, unsigned char *out, size_t out_len)
+{
+	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+	unsigned char mse[6];
+	unsigned char stream[IASECC_JCOP3_SM_BUF_SIZE];
+	unsigned char rbuf[IASECC_JCOP3_SM_BUF_SIZE];
+	unsigned char odd[IASECC_JCOP3_SM_BUF_SIZE];
+	size_t rlen = sizeof(rbuf), odd_len = sizeof(odd), split;
+	unsigned sw = 0;
+	int rv;
+
+	LOG_FUNC_CALLED(ctx);
+
+	if (!prv->security_env.key_size_bits)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INTERNAL);
+
+	if (in_len != BYTES4BITS(prv->security_env.key_size_bits)
+			|| in_len < 64 || in_len > 256)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+
+	split = in_len - 27;
+	stream[0] = 0x81;
+	memcpy(stream + 1, in, split);
+
+	rv = iasecc_jcop3_sm_open(card);
+	LOG_TEST_GOTO_ERR(ctx, rv, "cannot open SM session");
+
+	mse[0] = 0x80;
+	mse[1] = 0x01;
+	mse[2] = 0x8C;
+	mse[3] = 0x84;
+	mse[4] = 0x01;
+	mse[5] = IASECC_OBJECT_REF_LOCAL | prv->jcop3_key_ref;
+
+	rv = iasecc_jcop3_sm_cmd(card, 0x0C, 0x22, 0x41, 0xB8, mse, sizeof(mse), NULL, 0, 0,
+			NULL, NULL, NULL, NULL, &sw);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM MSE SET DST failed");
+	rv = iasecc_jcop3_check_sw(sw, NULL);
+	LOG_TEST_GOTO_ERR(ctx, rv, "MSE SET DST refused by the card");
+
+	rv = iasecc_jcop3_sm_cmd(card, 0x1C, 0x2A, 0x80, 0x86, stream, split + 1, NULL, 0, 0,
+			NULL, NULL, NULL, NULL, &sw);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM PSO part 1 failed");
+	rv = iasecc_jcop3_check_sw(sw, NULL);
+	LOG_TEST_GOTO_ERR(ctx, rv, "PSO part 1 refused by the card");
+
+	rv = iasecc_jcop3_sm_cmd(card, 0x0C, 0x2A, 0x80, 0x86, in + split, in_len - split, NULL, 0, 1,
+			rbuf, &rlen, odd, &odd_len, &sw);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM PSO part 2 failed");
+	rv = iasecc_jcop3_check_sw(sw, NULL);
+	LOG_TEST_GOTO_ERR(ctx, rv, "PSO part 2 refused by the card");
+
+	if (!rlen && odd_len) {
+		memcpy(rbuf, odd, odd_len);
+		rlen = odd_len;
+	}
+	if (!rlen) {
+		rv = SC_ERROR_UNKNOWN_DATA_RECEIVED;
+		goto err;
+	}
+	if (rlen > out_len) {
+		rv = SC_ERROR_BUFFER_TOO_SMALL;
+		goto err;
+	}
+
+	memcpy(out, rbuf, rlen);
+	rv = (int)rlen;
+
+err:
+	iasecc_jcop3_sm_close(card);
+	LOG_FUNC_RETURN(ctx, rv);
+}
+
+static int
+iasecc_jcop3_decipher(struct sc_card *card,
+		const unsigned char *in, size_t in_len, unsigned char *out, size_t out_len)
+{
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+
+	if (prv->security_env.operation != SC_SEC_OPERATION_DECIPHER
+			|| !prv->jcop3_key_ref)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
+
+	return iasecc_jcop3_raw_rsa(card, in, in_len, out, out_len);
+}
+
+/* CKM_RSA_X_509: sign the caller's complete block as-is. */
+static int
+iasecc_jcop3_compute_signature_raw(struct sc_card *card,
+		const unsigned char *in, size_t in_len, unsigned char *out, size_t out_len)
+{
+	return iasecc_jcop3_raw_rsa(card, in, in_len, out, out_len);
+}
+
+/* Build EMSA-PSS here (the applet adds no padding) and sign it as a raw block. */
+static int
+iasecc_jcop3_compute_signature_pss(struct sc_card *card,
+		const unsigned char *in, size_t in_len, unsigned char *out, size_t out_len)
+{
+	static const struct {
+		unsigned int algo;
+		unsigned long flags;
+	} hashes[] = {
+		{ SC_ALGORITHM_RSA_HASH_SHA1,
+			SC_ALGORITHM_RSA_HASH_SHA1 | SC_ALGORITHM_MGF1_SHA1 },
+		{ SC_ALGORITHM_RSA_HASH_SHA224,
+			SC_ALGORITHM_RSA_HASH_SHA224 | SC_ALGORITHM_MGF1_SHA224 },
+		{ SC_ALGORITHM_RSA_HASH_SHA256,
+			SC_ALGORITHM_RSA_HASH_SHA256 | SC_ALGORITHM_MGF1_SHA256 },
+		{ SC_ALGORITHM_RSA_HASH_SHA384,
+			SC_ALGORITHM_RSA_HASH_SHA384 | SC_ALGORITHM_MGF1_SHA384 },
+		{ SC_ALGORITHM_RSA_HASH_SHA512,
+			SC_ALGORITHM_RSA_HASH_SHA512 | SC_ALGORITHM_MGF1_SHA512 },
+	};
+	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
+	unsigned char em[512];
+	unsigned char digest[64];
+	unsigned long mgf, hash = 0;
+	size_t em_len, digest_len;
+	unsigned int algo = 0;
+	size_t i;
+	int rv;
+
+	LOG_FUNC_CALLED(ctx);
+
+	if (!prv->security_env.key_size_bits)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INTERNAL);
+
+	/* Sign-and-hash PSS input is DigestInfo-wrapped by the core; a bare digest
+	 * would need external hashing (not live-tested), so refuse it. */
+	digest_len = sizeof(digest);
+	rv = sc_pkcs1_strip_digest_info_prefix(&algo, in, in_len, digest, &digest_len);
+	if (rv != SC_SUCCESS)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+
+	for (i = 0; i < sizeof(hashes)/sizeof(hashes[0]); i++)   {
+		if (hashes[i].algo == algo)   {
+			hash = hashes[i].flags;
+			break;
+		}
+	}
+	mgf = prv->security_env.algorithm_flags & SC_ALGORITHM_MGF1_HASHES;
+	if (!hash || mgf != (hash & SC_ALGORITHM_MGF1_HASHES))
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+
+	/* PSS salt length = hash length. */
+	em_len = BYTES4BITS(prv->security_env.key_size_bits);
+	if (em_len < 64 || em_len > 256)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	rv = sc_pkcs1_encode(ctx, SC_ALGORITHM_RSA_PAD_PSS | hash, digest, digest_len,
+			em, &em_len, prv->security_env.key_size_bits, NULL);
+	LOG_TEST_RET(ctx, rv, "cannot build the PSS encoded message");
+
+	rv = iasecc_jcop3_raw_rsa(card, em, em_len, out, out_len);
+	LOG_FUNC_RETURN(ctx, rv);
+}
+
+/* Some SDOs (e.g. the public key) are readable only inside SM. */
+static int
+iasecc_jcop3_sdo_get_tagged_data(struct sc_card *card, const unsigned char *req,
+		size_t req_len, unsigned char *resp, size_t *resp_len)
+{
+	struct sc_context *ctx = card->ctx;
+	unsigned char rdo85[0x400];
+	size_t rdo85_len = sizeof(rdo85);
+	unsigned sw = 0;
+	int rv;
+
+	LOG_FUNC_CALLED(ctx);
+
+	rv = iasecc_jcop3_sm_open(card);
+	LOG_TEST_GOTO_ERR(ctx, rv, "cannot open SM session");
+
+	rv = iasecc_jcop3_sm_cmd(card, 0x0C, 0xCB, 0x3F, 0xFF, NULL, 0, req, req_len, 1,
+			NULL, NULL, rdo85, &rdo85_len, &sw);
+	LOG_TEST_GOTO_ERR(ctx, rv, "SM GET DATA failed");
+
+	rv = iasecc_jcop3_check_sw(sw, NULL);
+	LOG_TEST_GOTO_ERR(ctx, rv, "GET DATA refused by the card");
+
+	if (rdo85_len > *resp_len)   {
+		rv = SC_ERROR_BUFFER_TOO_SMALL;
+		goto err;
+	}
+
+	memcpy(resp, rdo85, rdo85_len);
+	*resp_len = rdo85_len;
+	rv = SC_SUCCESS;
+
+err:
+	iasecc_jcop3_sm_close(card);
+	LOG_FUNC_RETURN(ctx, rv);
+}
+
 static int
 iasecc_set_security_env(struct sc_card *card,
 		const struct sc_security_env *env, int se_num)
@@ -1683,6 +2721,9 @@ iasecc_set_security_env(struct sc_card *card,
 		0x80, 0x01, (IASECC_ALGORITHM_RSA_PKCS_DECRYPT | IASECC_ALGORITHM_SHA1)
 	};
 	int rv, operation = env->operation;
+
+	if (prv->jcop3)
+		return iasecc_jcop3_set_security_env(card, env, se_num);
 
 	/* TODO: take algorithm references from 5032, not from header file. */
 	LOG_FUNC_CALLED(ctx);
@@ -2427,12 +3468,16 @@ static int
 iasecc_pin_cmd(struct sc_card *card, struct sc_pin_cmd_data *data)
 {
 	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
 	int rv;
 
 	LOG_FUNC_CALLED(ctx);
 	sc_log(ctx, "iasecc_pin_cmd() cmd 0x%X, PIN type 0x%X, PIN reference %i, PIN-1 %p:%zu, PIN-2 %p:%zu",
 			data->cmd, data->pin_type, data->pin_reference,
 			data->pin1.data, data->pin1.len, data->pin2.data, data->pin2.len);
+
+	if (prv->jcop3)
+		LOG_FUNC_RETURN(ctx, iasecc_jcop3_pin_cmd(card, data));
 
 	switch (data->cmd)   {
 	case SC_PIN_CMD_VERIFY:
@@ -2768,6 +3813,7 @@ static int
 iasecc_sdo_get_tagged_data(struct sc_card *card, int sdo_tag, struct iasecc_sdo *sdo)
 {
 	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
 	struct sc_apdu apdu;
 	unsigned char sbuf[0x100];
 	size_t offs = sizeof(sbuf) - 1;
@@ -2823,6 +3869,18 @@ iasecc_sdo_get_tagged_data(struct sc_card *card, int sdo_tag, struct iasecc_sdo 
 	offs--;
 	sbuf[offs] = 0x4D;
 
+	if (prv->jcop3 && sdo_tag != IASECC_DOCP_TAG)   {
+		size_t rlen = sizeof(rbuf);
+
+		rv = iasecc_jcop3_sdo_get_tagged_data(card, sbuf + offs, sizeof(sbuf) - offs, rbuf, &rlen);
+		LOG_TEST_RET(ctx, rv, "cannot read the JCOP3 SDO data");
+
+		rv = iasecc_sdo_parse(card, rbuf, rlen, sdo);
+		LOG_TEST_RET(ctx, rv, "cannot parse the JCOP3 SDO data");
+
+		LOG_FUNC_RETURN(ctx, rv);
+	}
+
 	sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0xCB, 0x3F, 0xFF);
 	apdu.data = sbuf + offs;
 	apdu.datalen = sizeof(sbuf) - offs;
@@ -2847,6 +3905,7 @@ static int
 iasecc_sdo_get_data(struct sc_card *card, struct iasecc_sdo *sdo)
 {
 	struct sc_context *ctx = card->ctx;
+	struct iasecc_private_data *prv = (struct iasecc_private_data *)card->drv_data;
 	int rv, sdo_tag;
 
 	LOG_FUNC_CALLED(ctx);
@@ -2854,6 +3913,9 @@ iasecc_sdo_get_data(struct sc_card *card, struct iasecc_sdo *sdo)
 	sdo_tag = iasecc_sdo_tag_from_class(sdo->sdo_class);
 
 	rv = iasecc_sdo_get_tagged_data(card, sdo_tag, sdo);
+	/* the JCOP3 applet of the old BCCR cards has no separate DOCP data */
+	if (prv->jcop3)
+		LOG_FUNC_RETURN(ctx, rv);
 	/* When there is no public data 'GET DATA' returns error */
 	if (rv != SC_ERROR_INCORRECT_PARAMETERS)
 		LOG_TEST_RET(ctx, rv, "cannot parse ECC SDO data");
@@ -3025,6 +4087,9 @@ iasecc_decipher(struct sc_card *card,
 	sc_log(card->ctx, "crgram_len %zu;  outlen %zu", in_len, out_len);
 	if (!out || !out_len || in_len > SC_MAX_APDU_BUFFER_SIZE)
 		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ARGUMENTS);
+
+	if (((struct iasecc_private_data *)card->drv_data)->jcop3)
+		return iasecc_jcop3_decipher(card, in, in_len, out, out_len);
 
 	offs = 0;
 	sbuf[offs++] = 0x81;
@@ -3405,6 +4470,9 @@ iasecc_compute_signature(struct sc_card *card,
 
 	LOG_FUNC_CALLED(ctx);
 	sc_log(ctx, "inlen %zu, outlen %zu", in_len, out_len);
+
+	if (prv->jcop3)
+		return iasecc_jcop3_compute_signature(card, in, in_len, out, out_len);
 
 	if (env->operation == SC_SEC_OPERATION_SIGN)
 		return iasecc_compute_signature_dst(card, in, in_len, out,  out_len);
